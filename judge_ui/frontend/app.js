@@ -7,8 +7,10 @@ const rawNinoFormatEl = document.getElementById("raw-nino-format");
 const rawNinoIntentEl = document.getElementById("raw-nino-intent");
 const blockedListEl = document.getElementById("blocked-list");
 const verdictListEl = document.getElementById("verdict-list");
+const resetBlocklistBtn = document.getElementById("reset-blocklist-btn");
 
 let rulesRendered = false;
+let lastBlockedCount = 0;
 
 function fmtNumber(n) {
   return new Intl.NumberFormat().format(n || 0);
@@ -104,7 +106,10 @@ function renderRulesOnce(data) {
 }
 
 function renderBlocked(data) {
-  if (data.blocked_users.length === 0) {
+  lastBlockedCount = data.blocked_users.length;
+  resetBlocklistBtn.disabled = lastBlockedCount === 0;
+
+  if (lastBlockedCount === 0) {
     blockedListEl.innerHTML = '<li class="empty">None yet</li>';
     return;
   }
@@ -112,6 +117,21 @@ function renderBlocked(data) {
     .map((id) => `<li title="${id}">${id.slice(0, 8)}</li>`)
     .join("");
 }
+
+resetBlocklistBtn.addEventListener("click", async () => {
+  const count = lastBlockedCount;
+  const noun = count === 1 ? "session" : "sessions";
+  if (!confirm(`Unblock all ${count} currently blocked ${noun}? They'll be able to send messages again immediately.`)) {
+    return;
+  }
+  resetBlocklistBtn.disabled = true;
+  try {
+    await fetch("/api/blocklist/reset", { method: "POST" });
+  } catch (err) {
+    alert(`Failed to reset blocklist: ${err.message}`);
+  }
+  pollStats();
+});
 
 function renderVerdicts(data) {
   if (data.recent_verdicts.length === 0) {

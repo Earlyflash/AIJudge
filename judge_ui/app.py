@@ -44,6 +44,21 @@ RPS_WINDOW_SECONDS = 60
 app = FastAPI(title="AIJudge — Judge Dashboard")
 
 
+@app.post("/api/blocklist/reset")
+async def reset_blocklist():
+    cleared = []
+    if BLOCKLIST_PATH.exists():
+        try:
+            cleared = json.loads(BLOCKLIST_PATH.read_text())
+        except json.JSONDecodeError:
+            cleared = []
+    BLOCKLIST_PATH.write_text("[]")
+    # The Judge (a different process) refreshes its in-memory blocklist
+    # from this file's mtime on the next call, so no other coordination
+    # is needed for enforcement to pick this up.
+    return {"cleared_count": len(cleared), "cleared": cleared}
+
+
 @app.get("/api/judge-stats")
 async def judge_stats():
     blocked_users = []

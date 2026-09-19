@@ -78,12 +78,21 @@ it was pulled back out) — the dashboard is meant to work as a standalone
 admin/compliance view of what the Judge is doing, usable with or without
 the chat test UI running at all.
 
-Its one route, `/api/judge-stats`, returns: `judge_rules.RULES_SUMMARY`
+Its main route, `/api/judge-stats`, returns: `judge_rules.RULES_SUMMARY`
 plus the raw regex sources (for full transparency about what's actually
 enforced — see `judge_rules.py`), aggregate totals from `data/stats.json`
 (requests, verdict counts, token usage split into chat vs. judge-overhead,
 unique session count), a derived `requests_per_second` (see below), the
 current blocklist, and up to 50 recent verdicts.
+
+`POST /api/blocklist/reset` overwrites `blocked_users.json` with `[]` and
+returns what was cleared. There's no coordination needed with the Judge
+process beyond that write: `_refresh_blocklist` in `judge_logger.py`
+compares the file's mtime on every enforcement check and re-reads it if
+it's changed, so the reset takes effect on that process's very next call
+without a restart. The frontend confirms before calling it (unblocking
+everyone is a real, if easily-undone-by-testing-again, action) and disables
+the button when the blocklist is already empty.
 
 `requests_per_second` is derived from `stats["recent_timestamps"]`, a
 rolling list of epoch-second floats the Judge appends to on every request

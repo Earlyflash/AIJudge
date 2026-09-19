@@ -48,6 +48,28 @@ code, .raw-block code {
   padding: 1rem 1.2rem;
 }
 
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.panel-head h2 { margin-bottom: 0; }
+
+.reset-btn {
+  background: transparent;
+  color: var(--bad);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.reset-btn:hover { background: rgba(224, 71, 63, 0.12); }
+.reset-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
 h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0.8rem 0 0.4rem; }
 
