@@ -89,6 +89,18 @@ matches no pattern is marked "safe" without ever reaching the LLM judge —
 this is an intentional cost/coverage tradeoff (see README "Known
 limitations"), not an oversight to "fix" by removing the fast path.
 
+`_nino_check` (checked before `_rule_check`) is a separate, harder rule: UK
+National Insurance Number handling is a compliance requirement, not a
+judgment call, so it never reaches the LLM judge at all — deterministic
+regex only. It fires "bad" on either (1) an actual NI-number-shaped string
+anywhere in the input or output (treated as a PII handling breach on its
+own, regardless of surrounding context or intent), or (2) a request to
+verify/validate/check a NI number even with no real-looking number present.
+This deliberately over-flags — a string that merely has the right shape
+(two letters, six digits, one suffix letter) but isn't really a NINO (e.g.
+some other reference code) still gets blocked. That's intentional: for PII,
+false positives are the safe failure mode here.
+
 ### Data (`data/`, gitignored, path overridable via `AIJUDGE_DATA_DIR`)
 
 - `data/logs/<uuid>.json` — every request/response pair, written by the Judge
