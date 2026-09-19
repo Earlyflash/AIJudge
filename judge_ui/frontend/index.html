@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Judge Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Judge Dashboard</h1>
+    <p class="subtitle">Standalone view of what the Judge is doing — independent of the chat test UI. Reads <code>data/</code> directly.</p>
+  </header>
+
+  <main class="layout">
+    <section class="kpi-row" id="kpi-row" aria-label="Key statistics"></section>
+
+    <section class="panel">
+      <h2>Verdicts</h2>
+      <div class="stackbar-wrap">
+        <div class="stackbar" id="stackbar"></div>
+      </div>
+      <ul class="stackbar-legend" id="stackbar-legend"></ul>
+    </section>
+
+    <div class="two-col">
+      <section class="panel">
+        <h2>Active Rules</h2>
+        <p class="hint">Evaluated in this order — the first rule to reach a verdict wins.</p>
+        <ol class="rules-list" id="rules-list"></ol>
+
+        <details class="raw-patterns">
+          <summary>Raw pattern source (regex)</summary>
+          <div class="raw-block">
+            <h3>Suspicious pattern filter</h3>
+            <ul id="raw-suspicious"></ul>
+            <h3>NINO format</h3>
+            <code id="raw-nino-format"></code>
+            <h3>NINO verify-intent</h3>
+            <code id="raw-nino-intent"></code>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h2>Blocked Sessions</h2>
+        <ul class="blocked-list" id="blocked-list"><li class="empty">None yet</li></ul>
+      </section>
+    </div>
+
+    <section class="panel">
+      <h2>Recent Verdicts</h2>
+      <ul class="verdict-list" id="verdict-list"><li class="empty">None yet</li></ul>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

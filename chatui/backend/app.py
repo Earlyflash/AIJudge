@@ -8,6 +8,10 @@ cookie) and sent explicitly with each request as `session_id` — that's
 what lets the UI run several independent chat sessions in parallel from
 the same browser. It's forwarded to LiteLLM as the OpenAI `user` field,
 which is the id the Judge blocks when it flags an exchange as bad.
+
+The full Judge Dashboard (rules, token/request stats) is a separate
+service — see judge_ui/app.py — this backend only needs enough of the
+same data to drive its own "Recent Verdicts"/"Blocked Sessions" sidebar.
 """
 
 import json
@@ -24,13 +28,15 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-FRONTEND_DIR = BASE_DIR / "frontend"
+APP_DIR = Path(__file__).resolve().parent.parent  # chatui/
+REPO_ROOT = APP_DIR.parent
+FRONTEND_DIR = APP_DIR / "frontend"
+
 # Same anchoring logic as litellm_proxy/judge_logger.py — a relative
 # AIJUDGE_DATA_DIR must resolve against the repo root, not whatever cwd
 # this process happens to be started from.
 _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
-DATA_DIR = ((BASE_DIR / _data_dir_env) if _data_dir_env else (BASE_DIR / "data")).resolve()
+DATA_DIR = ((REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")).resolve()
 VERDICTS_DIR = DATA_DIR / "verdicts"
 BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
 

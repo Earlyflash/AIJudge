@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,9 @@ from litellm.integrations.custom_logger import CustomLogger
 # AIJUDGE_DATA_DIR resolve to litellm_proxy/data instead of the repo-root
 # data/ the backend reads from.
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+import judge_rules  # noqa: E402 — shared, side-effect-free rule definitions
+
 _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
 DATA_DIR = (REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")
 DATA_DIR = DATA_DIR.resolve()
@@ -43,11 +47,33 @@ LOGS_DIR = DATA_DIR / "logs"
 VERDICTS_DIR = DATA_DIR / "verdicts"
 BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
 JUDGE_LOG_FILE = DATA_DIR / "judge_activity.log"
+STATS_PATH = DATA_DIR / "stats.json"
+
+# How long a request timestamp stays in stats["recent_timestamps"], used to
+# derive a live requests/sec figure on the Judge Dashboard. Trimmed on every
+# write so the file never grows unbounded.
+STATS_WINDOW_SECONDS = 300
+
+
+def _default_stats():
+    return {
+        "total_requests": 0,
+        "verdict_counts": {"safe": 0, "suspicious": 0, "bad": 0},
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_tokens": 0,
+        "judge_overhead_tokens": 0,
+        "unique_sessions": [],
+        "recent_timestamps": [],
+    }
+
 
 for d in (LOGS_DIR, VERDICTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 if not BLOCKLIST_PATH.exists():
     BLOCKLIST_PATH.write_text("[]")
+if not STATS_PATH.exists():
+    STATS_PATH.write_text(json.dumps(_default_stats(), indent=2))
 
 # Every exchange the Judge sees, every prompt it sends to the LLM judge, and
 # every verdict it reaches goes to both the proxy's console and this file.
@@ -68,22 +94,16 @@ if not logger.handlers:
 # calls being logged/judged recursively.
 JUDGE_MODEL = os.environ.get("AIJUDGE_JUDGE_MODEL", "gemini/gemini-3.6-flash")
 
+# Pattern sources live in judge_rules.py (shared with the backend, which
+# displays them on the Judge Dashboard) so the dashboard can never drift
+# out of sync with what's actually being enforced here.
+
 # Cheap first-pass filter. A match doesn't mean "bad" — it means "worth a
 # closer look" and escalates to the LLM judge. Content that matches nothing
 # here is marked safe without spending an LLM call. That's the tradeoff of
 # a layered filter: fast and cheap, but a novel attack that matches none of
 # these patterns will sail through unreviewed.
-SUSPICIOUS_PATTERNS = [
-    re.compile(r"ignore (all|previous|above|prior) instructions", re.I),
-    re.compile(r"disregard (all|previous|above|prior) instructions", re.I),
-    re.compile(r"system prompt", re.I),
-    re.compile(r"api[_-]?key", re.I),
-    re.compile(r"reveal your (instructions|prompt|rules)", re.I),
-    re.compile(r"\bjailbreak\b", re.I),
-    re.compile(r"\bDAN\b"),
-    re.compile(r"you are now (in )?(developer|dan) mode", re.I),
-    re.compile(r"pretend (you|to) (are|be)", re.I),
-]
+SUSPICIOUS_PATTERNS = [re.compile(p, re.I) for p in judge_rules.SUSPICIOUS_PATTERNS_RAW]
 
 # UK National Insurance Number handling — a hard compliance rule, not a
 # judgment call, so it bypasses the LLM judge entirely (deterministic, not
@@ -93,19 +113,8 @@ SUSPICIOUS_PATTERNS = [
 #      output) is a PII handling breach on its own, regardless of intent.
 #   2. A request to verify/validate/check a NI number is bad even if no
 #      real-looking number was ever supplied.
-# Standard NINO shape: two letters (excluding D,F,I,Q,U,V as either letter,
-# and O as the second), six digits, one suffix letter A-D. Spacing/case
-# insensitive.
-NINO_FORMAT_PATTERN = re.compile(
-    r"\b[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b",
-    re.I,
-)
-NINO_MENTION = r"(?:national insurance(?: number)?|\bNI\s?number\b|\bNINO\b)"
-NINO_VERIFY_INTENT_PATTERN = re.compile(
-    rf"(?:verify|validate|check|confirm|is (?:it|this|that) (?:a )?(?:real|valid)|look\s?up).{{0,60}}{NINO_MENTION}"
-    rf"|{NINO_MENTION}.{{0,60}}(?:verify|validate|check|confirm|real|valid|look\s?up)",
-    re.I,
-)
+NINO_FORMAT_PATTERN = re.compile(judge_rules.NINO_FORMAT_REGEX, re.I)
+NINO_VERIFY_INTENT_PATTERN = re.compile(judge_rules.NINO_VERIFY_INTENT_REGEX, re.I)
 
 JUDGE_RUBRIC = """You are a security judge reviewing a single exchange between a user and an AI assistant.
 You are judging the USER'S INTENT, not whether the assistant complied. An
@@ -215,6 +224,9 @@ class JudgeLogger(CustomLogger):
             (VERDICTS_DIR / f"{record_id}.json").write_text(json.dumps(verdict_record, indent=2))
             logger.info("REQUEST %s | FINAL VERDICT=%s reason=%s", record_id, verdict.get("verdict"), verdict.get("reason"))
 
+            usage = self._extract_usage(response_obj) if success else None
+            self._record_request_stats(user_id, verdict.get("verdict"), usage)
+
             if verdict.get("verdict") == "bad" and user_id != "unknown":
                 self._block_user(user_id)
         except Exception as e:
@@ -226,6 +238,69 @@ class JudgeLogger(CustomLogger):
             return response_obj.choices[0].message.content or ""
         except Exception:
             return str(response_obj)
+
+    @staticmethod
+    def _extract_usage(response_obj):
+        usage = getattr(response_obj, "usage", None)
+        if usage is None:
+            return None
+
+        def get(attr):
+            val = getattr(usage, attr, None)
+            if val is None and isinstance(usage, dict):
+                val = usage.get(attr)
+            return val or 0
+
+        return {
+            "prompt_tokens": get("prompt_tokens"),
+            "completion_tokens": get("completion_tokens"),
+            "total_tokens": get("total_tokens"),
+        }
+
+    @staticmethod
+    def _update_stats(mutate):
+        """Read-modify-write data/stats.json. Safe under asyncio's cooperative
+        scheduling as long as callers do this with no `await` in between the
+        read and the write — see module docstring."""
+        try:
+            stats = json.loads(STATS_PATH.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            stats = _default_stats()
+        mutate(stats)
+        STATS_PATH.write_text(json.dumps(stats, indent=2))
+
+    def _record_request_stats(self, user_id, verdict, usage):
+        def mutate(stats):
+            stats["total_requests"] = stats.get("total_requests", 0) + 1
+
+            counts = stats.setdefault("verdict_counts", {"safe": 0, "suspicious": 0, "bad": 0})
+            key = verdict if verdict in counts else "suspicious"
+            counts[key] = counts.get(key, 0) + 1
+
+            if usage:
+                stats["total_prompt_tokens"] = stats.get("total_prompt_tokens", 0) + usage["prompt_tokens"]
+                stats["total_completion_tokens"] = stats.get("total_completion_tokens", 0) + usage["completion_tokens"]
+                stats["total_tokens"] = stats.get("total_tokens", 0) + usage["total_tokens"]
+
+            unique_sessions = stats.setdefault("unique_sessions", [])
+            if user_id and user_id != "unknown" and user_id not in unique_sessions:
+                unique_sessions.append(user_id)
+
+            now = time.time()
+            recent = [t for t in stats.get("recent_timestamps", []) if now - t < STATS_WINDOW_SECONDS]
+            recent.append(now)
+            stats["recent_timestamps"] = recent
+
+        self._update_stats(mutate)
+
+    def _record_judge_overhead(self, usage):
+        if not usage:
+            return
+
+        def mutate(stats):
+            stats["judge_overhead_tokens"] = stats.get("judge_overhead_tokens", 0) + usage["total_tokens"]
+
+        self._update_stats(mutate)
 
     @staticmethod
     def _nino_check(input_text, output_text):
@@ -267,6 +342,7 @@ class JudgeLogger(CustomLogger):
                 )
                 content = (resp.choices[0].message.content or "").strip()
                 logger.info("REQUEST %s | JUDGE RAW RESPONSE: %s", record_id, content or "<empty>")
+                self._record_judge_overhead(self._extract_usage(resp))
                 last_error = None
                 break
             except Exception as e:

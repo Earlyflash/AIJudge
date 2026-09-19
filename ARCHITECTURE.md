@@ -7,16 +7,20 @@ every non-obvious design choice below traces back to that constraint.
 
 ## 1. System overview
 
-Four processes/services, three of which you run locally:
+Five processes/services, four of which you run locally:
 
 - **Browser** — a static page with two independent chat panels (Session A /
   Session B), no build step.
-- **Backend** (`backend/app.py`, FastAPI, `:8000`) — serves the frontend and
-  is the only thing that talks to LiteLLM. Holds the only secret the
-  browser never sees (`LITELLM_MASTER_KEY`).
+- **Chat UI backend** (`chatui/backend/app.py`, FastAPI, `:8000`) — serves
+  `chatui/frontend/` and is the only thing that talks to LiteLLM. Holds the
+  only secret the browser never sees (`LITELLM_MASTER_KEY`).
 - **LiteLLM proxy** (`litellm_proxy/`, `:4000`) — OpenAI-compatible proxy in
   front of Gemini. Runs the Judge as a registered callback inside the same
   process.
+- **Judge Dashboard** (`judge_ui/app.py`, FastAPI, `:8010`) — a standalone
+  admin/compliance view of what the Judge is doing. Deliberately
+  independent of the chat UI backend (see §5) — reads `data/` directly and
+  works with or without the chat UI running at all.
 - **Gemini API** — the actual model provider, called both for user-facing
   chat (via the proxy) and by the Judge itself (directly, see §4).
 
@@ -27,7 +31,7 @@ flowchart LR
         B["Session B panel"]
     end
 
-    subgraph Backend["Backend (FastAPI :8000)"]
+    subgraph ChatUI["chatui (FastAPI :8000)"]
         BE["/api/chat, /api/status"]
     end
 
@@ -36,8 +40,13 @@ flowchart LR
         J["Judge (judge_logger.py)"]
     end
 
+    subgraph Dashboard["judge_ui (FastAPI :8010)"]
+        JD["/api/judge-stats"]
+    end
+
+    RULES["judge_rules.py<br/>(shared, no side effects)"]
     G[("Gemini API")]
-    DATA[("data/ on local disk<br/>logs, verdicts,<br/>blocked_users.json")]
+    DATA[("data/ on local disk<br/>logs, verdicts, stats.json,<br/>blocked_users.json")]
 
     A -- "POST /api/chat<br/>{session_id, message}" --> BE
     B -- "POST /api/chat<br/>{session_id, message}" --> BE
@@ -49,21 +58,28 @@ flowchart LR
     J -- "LLM-as-judge call<br/>(direct, bypasses proxy)" --> G
     J --> DATA
     BE -- "GET /api/status" --> DATA
+    JD -- "reads directly, no dependency on chatui" --> DATA
+    J -. imports .-> RULES
+    JD -. imports .-> RULES
 ```
 
 The dotted lines into the Judge are deliberate: one is a hook that runs
 *before* the call completes (cheap), the other fires *after* it already has
 (the heavy lifting). That split is the core of the whole design — see §3.
+Note `judge_ui` has no arrow to or from `chatui` at all — that's
+intentional, not an omission (see §5).
 
 ## 2. Components
 
 | Component | File(s) | Responsibility |
 |---|---|---|
-| Frontend | `frontend/index.html`, `app.js`, `style.css` | Two `ChatPanel` instances, each owning its own client-generated session id; polls `/api/status` for shared judge activity; animates a request pipeline per panel. |
-| Backend | `backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; exposes read-only judge activity. |
+| Frontend (chat UI) | `chatui/frontend/index.html`, `app.js`, `style.css` | Two `ChatPanel` instances, each owning its own client-generated session id; polls `/api/status` for shared judge activity; animates a request pipeline per panel. |
+| Chat UI backend | `chatui/backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; exposes a lightweight `/api/status` for its own sidebar. |
 | LiteLLM proxy | `litellm_proxy/config.yaml` | Declares the `gemini-flash` model and registers the Judge callback. |
-| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback with both an enforcement hook and a logging/judging hook (see §3). |
-| Data store | `data/` (gitignored) | The only shared state between the backend and proxy processes — flat JSON files and a log file, no database. |
+| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback with both an enforcement hook and a logging/judging hook (see §3); writes `data/stats.json`. |
+| Shared rules | `judge_rules.py` (repo root) | Side-effect-free regex/description source for both the Judge and the dashboard — the single source of truth for what's actually enforced. |
+| Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view: rules, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
+| Data store | `data/` (gitignored) | The only shared state across all three Python processes — flat JSON files and a log file, no database. |
 
 ## 3. The core design decision: two timelines, not one
 
@@ -167,7 +183,8 @@ by default — fail closed rather than silently letting it through.
 | Rubric scores intent, not compliance | A refused attack attempt is still an attack attempt | None — this closed a real gap found in testing |
 | Session identity is a client-generated id, not a cookie | Cookies are one-per-domain; can't run two independent sessions in one browser tab | Backend has zero server-side session state; a session is only as trustworthy as whatever the client sends |
 | No Postgres / virtual-key DB for LiteLLM's built-in admin UI | Kept the whole system to flat local JSON files, no extra infra | LiteLLM's own `/ui` admin dashboard doesn't work (it requires a DB); not needed since our own UI + blocklist file cover the same need here |
-| `AIJUDGE_DATA_DIR` is anchored to the repo root via `Path(__file__).resolve().parent.parent` in both the proxy and the backend | The two processes run from different working directories (`litellm_proxy/` vs. repo root); a naively relative path resolved to two *different* folders with no error | Both files must keep this resolution logic identical, or the bug (UI silently reading the wrong `data/`) comes back |
+| `AIJUDGE_DATA_DIR` is anchored to the repo root via `Path(__file__).resolve()` + the right number of `.parent`s in each of the three Python entry points | They run from different working directories and different folder depths (`litellm_proxy/`, `chatui/backend/`, `judge_ui/`); a naively relative path resolved to *different* folders with no error | Each file must recompute the right `.parent` chain for its own depth — don't copy one file's chain into another without checking it |
+| Judge Dashboard is a fully separate service (own process, port, and codebase), not a route on the chat UI's backend | Explicit ask: it should work as a standalone admin/compliance tool, usable without the chat test UI running at all | Two FastAPI apps instead of one; `judge_rules.py` exists specifically so they don't duplicate (and drift on) what the rules actually are |
 
 ## 6. Data & storage
 
@@ -178,14 +195,23 @@ Everything the Judge sees and decides lives under `AIJUDGE_DATA_DIR`
 - `data/verdicts/<uuid>.json` — the Judge's verdict for that pair (read by
   the backend's `/api/status` for the "Recent Verdicts" panel)
 - `data/blocked_users.json` — flat JSON array of blocked session ids (read
-  by both the Judge's own enforcement hook and `/api/status`)
+  by the Judge's own enforcement hook, `/api/status`, and `/api/judge-stats`)
 - `data/judge_activity.log` — human-readable trace of every exchange, every
   prompt sent to the LLM judge, its raw response, and the final verdict
   (also mirrored to the LiteLLM proxy's console)
+- `data/stats.json` — running totals only the Judge writes and only the
+  Judge Dashboard reads: request count, verdict breakdown, token usage
+  (chat traffic and judge-overhead tracked separately), unique sessions
+  seen, and a rolling window of request timestamps the dashboard turns
+  into requests/sec
 
 There is no database and no locking — writes are whole-file rewrites of
 small JSON structures. Fine at this scale; wouldn't survive many concurrent
-writers.
+writers. `stats.json` updates specifically rely on there being no `await`
+between reading and writing it within a single update (see
+`_update_stats` in `judge_logger.py`) — asyncio only switches tasks at an
+`await`, so that's safe today but would need a real lock if that method
+ever grew one.
 
 ## 7. Known limitations
 
