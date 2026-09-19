@@ -54,6 +54,12 @@ STATS_PATH = DATA_DIR / "stats.json"
 # write so the file never grows unbounded.
 STATS_WINDOW_SECONDS = 300
 
+# Token consumption is also bucketed per minute (stats["token_buckets"]) so the
+# dashboard can chart chat vs judge spend over time. Buckets older than this
+# are dropped on every write.
+TOKEN_BUCKET_SECONDS = 60
+TOKEN_BUCKET_KEEP = 60
+
 
 def _default_stats():
     return {
@@ -63,6 +69,16 @@ def _default_stats():
         "total_completion_tokens": 0,
         "total_tokens": 0,
         "judge_overhead_tokens": 0,
+        "judge_prompt_tokens": 0,
+        "judge_completion_tokens": 0,
+        "judge_calls": 0,
+        # How each exchange was resolved: deterministic NINO rule, regex
+        # safe-pass (no LLM), or escalated to the LLM judge (costs tokens).
+        "judge_paths": {"nino": 0, "rule": 0, "llm": 0},
+        # epoch-minute (str) -> {"chat": tokens, "judge": tokens}
+        "token_buckets": {},
+        # session id -> {"chat": tokens, "judge": tokens, "requests": n}
+        "session_tokens": {},
         "unique_sessions": [],
         "recent_timestamps": [],
     }
@@ -209,23 +225,34 @@ class JudgeLogger(CustomLogger):
             }
             (LOGS_DIR / f"{record_id}.json").write_text(json.dumps(record, indent=2))
 
+            judge_usage = None
             verdict = self._nino_check(input_text, output_text)
             if verdict is not None:
+                judge_path = "nino"
                 logger.info("REQUEST %s | verdict=bad (NINO hard rule, no LLM call): %s", record_id, verdict.get("reason"))
             else:
                 verdict = self._rule_check(input_text, output_text)
                 if verdict is None:
                     logger.info("REQUEST %s | escalating to LLM judge (rule filter matched)", record_id)
-                    verdict = await self._llm_judge(input_text, output_text, record_id=record_id)
+                    judge_path = "llm"
+                    verdict, judge_usage = await self._llm_judge(input_text, output_text, record_id=record_id)
                 else:
+                    judge_path = "rule"
                     logger.info("REQUEST %s | verdict=safe (rule filter, no LLM call): %s", record_id, verdict.get("reason"))
 
-            verdict_record = {**record, "verdict": verdict.get("verdict"), "reason": verdict.get("reason")}
+            usage = self._extract_usage(response_obj) if success else None
+            verdict_record = {
+                **record,
+                "verdict": verdict.get("verdict"),
+                "reason": verdict.get("reason"),
+                "judge_path": judge_path,
+                "chat_tokens": (usage or {}).get("total_tokens", 0),
+                "judge_tokens": (judge_usage or {}).get("total_tokens", 0),
+            }
             (VERDICTS_DIR / f"{record_id}.json").write_text(json.dumps(verdict_record, indent=2))
             logger.info("REQUEST %s | FINAL VERDICT=%s reason=%s", record_id, verdict.get("verdict"), verdict.get("reason"))
 
-            usage = self._extract_usage(response_obj) if success else None
-            self._record_request_stats(user_id, verdict.get("verdict"), usage)
+            self._record_request_stats(user_id, verdict.get("verdict"), usage, judge_usage, judge_path)
 
             if verdict.get("verdict") == "bad" and user_id != "unknown":
                 self._block_user(user_id)
@@ -269,7 +296,7 @@ class JudgeLogger(CustomLogger):
         mutate(stats)
         STATS_PATH.write_text(json.dumps(stats, indent=2))
 
-    def _record_request_stats(self, user_id, verdict, usage):
+    def _record_request_stats(self, user_id, verdict, usage, judge_usage, judge_path):
         def mutate(stats):
             stats["total_requests"] = stats.get("total_requests", 0) + 1
 
@@ -282,6 +309,33 @@ class JudgeLogger(CustomLogger):
                 stats["total_completion_tokens"] = stats.get("total_completion_tokens", 0) + usage["completion_tokens"]
                 stats["total_tokens"] = stats.get("total_tokens", 0) + usage["total_tokens"]
 
+            chat_tokens = usage["total_tokens"] if usage else 0
+            judge_tokens = judge_usage["total_tokens"] if judge_usage else 0
+
+            paths = stats.setdefault("judge_paths", {"nino": 0, "rule": 0, "llm": 0})
+            paths[judge_path] = paths.get(judge_path, 0) + 1
+
+            if judge_usage:
+                stats["judge_calls"] = stats.get("judge_calls", 0) + 1
+                stats["judge_prompt_tokens"] = stats.get("judge_prompt_tokens", 0) + judge_usage["prompt_tokens"]
+                stats["judge_completion_tokens"] = stats.get("judge_completion_tokens", 0) + judge_usage["completion_tokens"]
+                stats["judge_overhead_tokens"] = stats.get("judge_overhead_tokens", 0) + judge_tokens
+
+            sess = stats.setdefault("session_tokens", {}).setdefault(
+                user_id or "unknown", {"chat": 0, "judge": 0, "requests": 0}
+            )
+            sess["chat"] += chat_tokens
+            sess["judge"] += judge_tokens
+            sess["requests"] += 1
+
+            bucket_now = int(time.time() // TOKEN_BUCKET_SECONDS) * TOKEN_BUCKET_SECONDS
+            buckets = stats.setdefault("token_buckets", {})
+            b = buckets.setdefault(str(bucket_now), {"chat": 0, "judge": 0})
+            b["chat"] += chat_tokens
+            b["judge"] += judge_tokens
+            cutoff = bucket_now - TOKEN_BUCKET_SECONDS * (TOKEN_BUCKET_KEEP - 1)
+            stats["token_buckets"] = {k: v for k, v in buckets.items() if int(k) >= cutoff}
+
             unique_sessions = stats.setdefault("unique_sessions", [])
             if user_id and user_id != "unknown" and user_id not in unique_sessions:
                 unique_sessions.append(user_id)
@@ -290,15 +344,6 @@ class JudgeLogger(CustomLogger):
             recent = [t for t in stats.get("recent_timestamps", []) if now - t < STATS_WINDOW_SECONDS]
             recent.append(now)
             stats["recent_timestamps"] = recent
-
-        self._update_stats(mutate)
-
-    def _record_judge_overhead(self, usage):
-        if not usage:
-            return
-
-        def mutate(stats):
-            stats["judge_overhead_tokens"] = stats.get("judge_overhead_tokens", 0) + usage["total_tokens"]
 
         self._update_stats(mutate)
 
@@ -331,6 +376,7 @@ class JudgeLogger(CustomLogger):
 
         content = None
         last_error = None
+        usage = None
         for attempt in range(2):  # one retry on transient provider errors
             try:
                 resp = await litellm.acompletion(
@@ -342,7 +388,7 @@ class JudgeLogger(CustomLogger):
                 )
                 content = (resp.choices[0].message.content or "").strip()
                 logger.info("REQUEST %s | JUDGE RAW RESPONSE: %s", record_id, content or "<empty>")
-                self._record_judge_overhead(self._extract_usage(resp))
+                usage = self._extract_usage(resp)
                 last_error = None
                 break
             except Exception as e:
@@ -352,7 +398,7 @@ class JudgeLogger(CustomLogger):
                     await asyncio.sleep(1.5)
 
         if last_error is not None:
-            return {"verdict": "suspicious", "reason": f"Judge call failed: {last_error}"}
+            return {"verdict": "suspicious", "reason": f"Judge call failed: {last_error}"}, usage
 
         if not content:
             # The judge model itself returned nothing for this exchange —
@@ -363,7 +409,7 @@ class JudgeLogger(CustomLogger):
                 "verdict": "bad",
                 "reason": "LLM judge returned no content when asked to review this exchange "
                           "(likely safety-filtered) — treated as bad out of caution.",
-            }
+            }, usage
 
         match = re.search(r"\{.*\}", content, re.S)
         json_text = match.group(0) if match else content
@@ -373,11 +419,11 @@ class JudgeLogger(CustomLogger):
             return {
                 "verdict": "suspicious",
                 "reason": f"Judge response wasn't valid JSON: {content[:200]!r}",
-            }
+            }, usage
 
         if verdict.get("verdict") not in ("safe", "suspicious", "bad"):
-            return {"verdict": "suspicious", "reason": f"Judge returned an unrecognized verdict: {verdict!r}"}
-        return verdict
+            return {"verdict": "suspicious", "reason": f"Judge returned an unrecognized verdict: {verdict!r}"}, usage
+        return verdict, usage
 
     def _block_user(self, user_id):
         blocklist = self._refresh_blocklist()

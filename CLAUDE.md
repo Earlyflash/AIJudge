@@ -177,7 +177,13 @@ failure mode here.
   plus `judge_overhead_tokens` from the LLM-judge's own calls, tracked
   separately in `_llm_judge`), `unique_sessions` (list, for a count), and
   `recent_timestamps` (rolling window, trimmed to `STATS_WINDOW_SECONDS` on
-  every write, that the dashboard turns into requests/sec). All updates go
+  every write, that the dashboard turns into requests/sec). Token
+  attribution also lives here: `judge_prompt_tokens`/`judge_completion_tokens`/
+  `judge_calls`, `judge_paths` (how each exchange was resolved: `nino` /
+  `rule` / `llm` — only `llm` costs tokens), `token_buckets` (per-minute
+  chat vs judge totals, last 60 minutes, drives the dashboard timeline) and
+  `session_tokens` (per-session chat/judge totals). Verdict files also carry
+  `chat_tokens`, `judge_tokens` and `judge_path`. All updates go
   through `_update_stats`'s read-modify-write-whole-file pattern — safe
   under asyncio because there's no `await` between the read and the write
   in any caller, so no other task can interleave.

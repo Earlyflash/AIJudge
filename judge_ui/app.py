@@ -41,6 +41,10 @@ STATS_PATH = DATA_DIR / "stats.json"
 # which is how long a timestamp survives in stats["recent_timestamps"].
 RPS_WINDOW_SECONDS = 60
 
+# How many one-minute token buckets the dashboard's timeline shows. Must be
+# <= TOKEN_BUCKET_KEEP in litellm_proxy/judge_logger.py.
+TIMELINE_MINUTES = 30
+
 app = FastAPI(title="AIJudge — Judge Dashboard")
 
 
@@ -76,6 +80,23 @@ async def judge_stats():
     now = time.time()
     requests_last_window = sum(1 for t in recent_timestamps if now - t <= RPS_WINDOW_SECONDS)
 
+    # Per-minute chat vs judge token spend for the last TIMELINE_MINUTES,
+    # zero-filled so the chart has a continuous x axis.
+    buckets = stats.get("token_buckets", {})
+    this_minute = int(now // 60) * 60
+    token_timeline = []
+    for i in range(TIMELINE_MINUTES - 1, -1, -1):
+        t = this_minute - i * 60
+        b = buckets.get(str(t), {})
+        token_timeline.append({"t": t, "chat": b.get("chat", 0), "judge": b.get("judge", 0)})
+
+    session_tokens = stats.get("session_tokens", {})
+    top_sessions = sorted(
+        ({"session_id": sid, **v} for sid, v in session_tokens.items()),
+        key=lambda s: s.get("chat", 0) + s.get("judge", 0),
+        reverse=True,
+    )[:8]
+
     recent_verdicts = []
     if VERDICTS_DIR.exists():
         files = sorted(VERDICTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]
@@ -97,12 +118,18 @@ async def judge_stats():
             "total_completion_tokens": stats.get("total_completion_tokens", 0),
             "total_tokens": stats.get("total_tokens", 0),
             "judge_overhead_tokens": stats.get("judge_overhead_tokens", 0),
+            "judge_prompt_tokens": stats.get("judge_prompt_tokens", 0),
+            "judge_completion_tokens": stats.get("judge_completion_tokens", 0),
+            "judge_calls": stats.get("judge_calls", 0),
             "unique_sessions": len(stats.get("unique_sessions", [])),
             "blocked_sessions": len(blocked_users),
         },
         "requests_per_second": round(requests_last_window / RPS_WINDOW_SECONDS, 3),
         "requests_last_window": requests_last_window,
         "window_seconds": RPS_WINDOW_SECONDS,
+        "judge_paths": stats.get("judge_paths", {"nino": 0, "rule": 0, "llm": 0}),
+        "token_timeline": token_timeline,
+        "top_sessions": top_sessions,
         "blocked_users": blocked_users,
         "recent_verdicts": recent_verdicts,
     }

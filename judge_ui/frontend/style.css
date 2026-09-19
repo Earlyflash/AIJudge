@@ -8,6 +8,10 @@
   --safe: #3fbf6f;
   --suspicious: #e0a72f;
   --bad: #e0473f;
+  --chat: #5b8cff;
+  --judge: #c25bff;
+  --neutral-a: #6b7280;
+  --neutral-b: #9aa1ab;
 }
 
 * { box-sizing: border-box; }
@@ -151,6 +155,47 @@ h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 .stackbar-legend .swatch.suspicious { background: var(--suspicious); }
 .stackbar-legend .swatch.bad { background: var(--bad); }
 .stackbar-legend .count { color: var(--muted); }
+
+/* --- Token consumption --- */
+
+.token-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr;
+  gap: 1.5rem;
+}
+@media (max-width: 900px) { .token-grid { grid-template-columns: 1fr; } }
+
+.stackbar .seg.chat { background: var(--chat); }
+.stackbar .seg.judge { background: var(--judge); }
+.stackbar .seg.nino { background: var(--neutral-a); }
+.stackbar .seg.rule { background: var(--neutral-b); }
+.stackbar .seg.llm { background: var(--judge); }
+.swatch.chat { background: var(--chat); }
+.swatch.judge { background: var(--judge); }
+.swatch.nino { background: var(--neutral-a); }
+.swatch.rule { background: var(--neutral-b); }
+.swatch.llm { background: var(--judge); }
+.stackbar-legend .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+.hbars { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.8rem; }
+.hbar-row { display: grid; grid-template-columns: 9.5rem 1fr 5.5rem; align-items: center; gap: 0.6rem; font-size: 0.8rem; }
+.hbar-row .hbar-label { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hbar-row .hbar-value { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.hbar-track { background: #0f1115; border: 1px solid var(--border); border-radius: 4px; height: 14px; display: flex; overflow: hidden; }
+.hbar-fill { height: 100%; }
+.hbar-fill + .hbar-fill { border-left: 2px solid var(--panel); }
+.hbar-fill.chat { background: var(--chat); }
+.hbar-fill.judge { background: var(--judge); }
+.hbar-fill.light { opacity: 0.55; }
+
+.chart-scroll { overflow-x: auto; }
+.timeline { width: 100%; min-width: 480px; height: 180px; display: block; }
+.timeline .grid { stroke: var(--border); stroke-width: 1; }
+.timeline text { fill: var(--muted); font-size: 10px; }
+.timeline rect.chat { fill: var(--chat); }
+.timeline rect.judge { fill: var(--judge); }
+.timeline rect.hit { fill: transparent; }
+.timeline rect.hit:hover { fill: rgba(255, 255, 255, 0.06); }
 
 /* --- Two column layout --- */
 

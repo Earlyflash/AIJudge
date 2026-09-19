@@ -84,7 +84,17 @@ async def chat(req: ChatRequest):
 
     data = resp.json()
     reply = data["choices"][0]["message"]["content"]
-    return {"reply": reply, "session_id": session_id, "latency_ms": latency_ms}
+    usage = data.get("usage") or {}
+    return {
+        "reply": reply,
+        "session_id": session_id,
+        "latency_ms": latency_ms,
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens") or 0,
+            "completion_tokens": usage.get("completion_tokens") or 0,
+            "total_tokens": usage.get("total_tokens") or 0,
+        },
+    }
 
 
 @app.get("/api/status")

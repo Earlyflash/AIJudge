@@ -21,6 +21,8 @@ class ChatPanel {
     this.newSessionBtn = this.root.querySelector(".new-session-btn");
     this.pipelineEl = this.root.querySelector(".pipeline");
     this.captionEl = this.root.querySelector(".pipeline-caption");
+    this.tokenTotalEl = this.root.querySelector(".token-total");
+    this.tokenSplitEl = this.root.querySelector(".token-split");
     this.bannerEl = this.root.querySelector(".banner");
     this.messagesEl = this.root.querySelector(".messages");
     this.formEl = this.root.querySelector(".chat-form");
@@ -37,6 +39,8 @@ class ChatPanel {
   newSession() {
     this.sessionId = crypto.randomUUID();
     knownSessions[this.sessionId] = { label: this.title, accent: this.accent };
+    this.tokens = { prompt: 0, completion: 0, total: 0 };
+    this.renderTokens();
     this.sessionIdEl.textContent = `id: ${this.sessionId.slice(0, 8)}`;
     this.sessionIdEl.title = this.sessionId;
     this.messagesEl.innerHTML = "";
@@ -44,10 +48,22 @@ class ChatPanel {
     this.setPipeline("idle", "Idle");
   }
 
-  addMessage(role, text) {
+  renderTokens() {
+    const f = (n) => new Intl.NumberFormat().format(n);
+    this.tokenTotalEl.textContent = `Tokens: ${f(this.tokens.total)}`;
+    this.tokenSplitEl.textContent = `${f(this.tokens.prompt)} in / ${f(this.tokens.completion)} out`;
+  }
+
+  addMessage(role, text, usage) {
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     div.textContent = text;
+    if (usage) {
+      const meta = document.createElement("div");
+      meta.className = "msg-tokens";
+      meta.textContent = `${usage.prompt_tokens} in / ${usage.completion_tokens} out · ${usage.total_tokens} tokens`;
+      div.appendChild(meta);
+    }
     this.messagesEl.appendChild(div);
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
@@ -93,7 +109,14 @@ class ChatPanel {
         if (blocked) this.bannerEl.textContent = "This session has been blocked by AIJudge.";
       } else {
         this.setPipeline("success", `Round trip: ${elapsed}ms`);
-        this.addMessage("assistant", data.reply);
+        const usage = data.usage;
+        if (usage) {
+          this.tokens.prompt += usage.prompt_tokens;
+          this.tokens.completion += usage.completion_tokens;
+          this.tokens.total += usage.total_tokens;
+          this.renderTokens();
+        }
+        this.addMessage("assistant", data.reply, usage);
       }
     } catch (err) {
       this.setPipeline("error", "Network error", "backend");
@@ -150,6 +173,7 @@ function renderStatus(status) {
         <span class="tag ${tagClass}">${v.verdict || "unknown"}</span>
         <div class="reason">${v.reason || ""}</div>
         <div class="user"><span class="session-swatch" style="background:${color}"></span>${text} &middot; ${new Date(v.timestamp).toLocaleTimeString()}</div>
+        <div class="user">chat ${v.chat_tokens ?? 0} tok &middot; judge ${v.judge_tokens ?? 0} tok</div>
       `;
       verdictListEl.appendChild(li);
     }

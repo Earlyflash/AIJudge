@@ -23,6 +23,30 @@
       <ul class="stackbar-legend" id="stackbar-legend"></ul>
     </section>
 
+    <section class="panel">
+      <h2>Token Consumption</h2>
+      <p class="hint">Where tokens are spent across the solution. Chat = user-facing calls through LiteLLM; Judge = the LLM-as-judge's own calls (only made when the regex filter escalates).</p>
+      <div class="token-grid">
+        <div>
+          <h3>By component</h3>
+          <div class="stackbar-wrap"><div class="stackbar" id="token-share-bar"></div></div>
+          <ul class="stackbar-legend" id="token-share-legend"></ul>
+          <div id="token-components" class="hbars"></div>
+        </div>
+        <div>
+          <h3>How exchanges were judged</h3>
+          <div class="stackbar-wrap"><div class="stackbar" id="path-bar"></div></div>
+          <ul class="stackbar-legend" id="path-legend"></ul>
+          <p class="hint" id="path-note"></p>
+        </div>
+      </div>
+      <h3>Tokens per minute (last 30 min)</h3>
+      <div class="chart-scroll"><svg id="token-timeline" class="timeline" role="img" aria-label="Tokens per minute, chat versus judge"></svg></div>
+      <ul class="stackbar-legend" id="timeline-legend"></ul>
+      <h3>Top sessions by tokens</h3>
+      <div id="token-sessions" class="hbars"></div>
+    </section>
+
     <div class="two-col">
       <section class="panel">
         <h2>Active Rules</h2>
