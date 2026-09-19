@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AIJudge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>AIJudge Test Console</h1>
+    <p class="subtitle">Two independent chat sessions, each with its own identity to LiteLLM. Every exchange is logged and judged.</p>
+  </header>
+
+  <div class="layout">
+    <template id="chat-panel-template">
+      <section class="chat-panel">
+        <div class="chat-panel-head">
+          <h2 class="chat-title"></h2>
+          <div class="session-controls">
+            <span class="session-id" title="">id: ----</span>
+            <button type="button" class="new-session-btn">New Session</button>
+          </div>
+        </div>
+
+        <div class="pipeline idle">
+          <div class="pipe-node" data-node="browser"><span class="dot"></span><label>Browser</label></div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node" data-node="backend"><span class="dot"></span><label>Backend</label></div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node" data-node="litellm"><span class="dot"></span><label>LiteLLM</label></div>
+          <div class="pipe-link"></div>
+          <div class="pipe-node" data-node="gemini"><span class="dot"></span><label>Gemini</label></div>
+        </div>
+        <div class="pipeline-caption">Idle</div>
+
+        <div class="banner hidden"></div>
+
+        <div class="messages"></div>
+
+        <form class="chat-form">
+          <textarea class="chat-input" placeholder="Type a message..." rows="2"></textarea>
+          <button type="submit" class="send-btn">Send</button>
+        </form>
+      </section>
+    </template>
+
+    <div id="panel-a-slot"></div>
+    <div id="panel-b-slot"></div>
+
+    <aside class="judge-panel">
+      <h2>Judge Activity</h2>
+      <div class="judge-section">
+        <h3>Blocked Sessions</h3>
+        <ul id="blocked-list" class="blocked-list"><li class="empty">None yet</li></ul>
+      </div>
+      <div class="judge-section">
+        <h3>Recent Verdicts</h3>
+        <ul id="verdict-list" class="verdict-list"><li class="empty">None yet</li></ul>
+      </div>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

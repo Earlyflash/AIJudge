@@ -1,0 +1,14 @@
+model_list:
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  # Registers our async logging + pre-call blocklist hook. Must be run with
+  # this directory (litellm_proxy/) as the working directory so the
+  # "judge_logger" module resolves.
+  callbacks: ["judge_logger.judge_callback"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
