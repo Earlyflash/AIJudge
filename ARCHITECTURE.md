@@ -81,27 +81,47 @@ intentional, not an omission (see §5).
 | Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view: rules, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
 | Data store | `data/` (gitignored) | The only shared state across all three Python processes — flat JSON files and a log file, no database. |
 
-## 3. The core design decision: two timelines, not one
+## 3. The core design decision: a fast tier and a slow tier
 
-The Judge has two responsibilities, and they deliberately run at different
-points in the request lifecycle:
+The Judge is split by *cost and certainty*, and each tier runs at a different
+point in the request lifecycle:
 
-- **Enforcement** — `async_pre_call_hook`. Runs synchronously, *before*
-  every call reaches Gemini. Kept to a single in-memory set lookup against
-  the blocklist. It can only reject a call based on a verdict from a
-  *previous* exchange — never the one currently in flight.
-- **Judging** — `async_log_success_event` / `async_log_failure_event`.
-  Fired via `asyncio.create_task` *after* the response has already gone
-  back to the caller. All the expensive work — regex checks, and
-  occasionally a whole extra LLM call — happens here, off the critical
-  path.
+- **Fast** — deterministic rules (`judge_rules.FAST_RULES`): regex, plus a
+  Luhn check. No AI. Input rules run in `async_pre_call_hook`, *in the
+  request path, before the call reaches Gemini*, so a `block` rule stops the
+  **current** request. A `score` rule instead adds points to the session's
+  suspicion score (minor signal +1, major +5). Output rules run after the
+  response has gone back, so they can only affect later turns.
+- **Slow** — the LLM judge. Never run per exchange. When a session's score
+  has climbed `SLOW_REVIEW_THRESHOLD` (5) since its last review, a
+  background task (`asyncio.create_task`, *after* the response has gone back)
+  has the LLM review the whole session: recent transcript plus the fast
+  rules that fired. `bad` blocks the session, `safe` resets its score to 0,
+  `suspicious` keeps the score and moves the review watermark, so another 5
+  points are needed before the next review.
 
-The consequence, which is easy to expect wrong: **a message that is itself
-judged "bad" still gets a completely normal reply.** Only that session's
-*next* message gets rejected, once the background judging has finished and
-updated the blocklist. There is no way to interrupt or block a response
-that's already being generated without reintroducing the latency this
-design exists to avoid.
+Why the LLM is gated by a score rather than "any regex match": regex can only
+see shapes and phrases, not intent or a slow build-up over several turns.
+The LLM can, but it's slow and costs tokens, so it's the second opinion you
+pay for only once a session has accumulated enough weak evidence. One
+ambiguous phrase ("system prompt") is +1; a clear one ("ignore previous
+instructions") is +5 and triggers review alone.
+
+**The fast tier's added latency is measured, not assumed.**
+`async_pre_call_hook` times its own work with `time.perf_counter` — the
+blocklist lookup, the regex scan of the newest user message, and the
+in-memory score update — and records it per session and globally
+(`data/sessions.json`; the chat backend echoes the per-request figure as
+`fast_check_ms`, and both UIs show it). All file writes are deliberately
+*outside* the measured window and off the request path: session state lives
+in memory and is flushed to disk by a debounced timer (immediately, on a
+rejection). Typical cost is tens of microseconds.
+
+The consequence for the *slow* tier is unchanged and easy to expect wrong:
+**a message that triggers a slow review still gets a completely normal
+reply.** Only the session's *next* message is rejected, once the background
+review has finished and updated the blocklist. Only a fast `block` rule can
+stop the message in flight.
 
 ```mermaid
 sequenceDiagram
@@ -113,50 +133,45 @@ sequenceDiagram
 
     U->>B: POST /api/chat (session_id, message)
     B->>L: POST /chat/completions
-    L->>L: async_pre_call_hook: session_id blocked? No -> proceed
-    L->>G: completion request
-    G-->>L: response
-    L-->>B: response
-    B-->>U: reply (pipeline UI: success)
-    L--)J: async_log_success_event (fire-and-forget, AFTER response sent)
-    J->>J: NINO hard rule, then regex filter
-    alt ambiguous - escalate
-        J->>G: LLM-as-judge prompt (direct call, bypasses proxy)
-        G-->>J: verdict JSON
+    L->>L: pre-call: blocklist check + FAST rules on the message (timed)
+    alt fast "block" rule (NINO, key, ...)
+        L-->>B: 400 "Blocked by AIJudge" (this request never reaches Gemini)
+    else score rules add to the session's suspicion score
+        L->>G: completion request
+        G-->>L: response
+        L-->>B: response (+ fast_check_ms via sessions.json)
+        B-->>U: reply
+        L--)J: async_log_success_event (AFTER response sent)
+        J->>J: FAST rules on the output, update score
+        alt score climbed >= 5 since last review
+            J->>G: SLOW review of the session (direct call, bypasses proxy)
+            G-->>J: verdict JSON
+        end
+        J->>J: write request + verdict + session state to data/
+        alt fast block on output, or slow verdict == "bad"
+            J->>J: add session_id to blocked_users.json
+        end
     end
-    J->>J: write request + verdict to data/
-    alt verdict == "bad"
-        J->>J: add session_id to blocked_users.json
-    end
-
-    Note over U,J: --- same session sends its NEXT message ---
-    U->>B: POST /api/chat (same session_id)
-    B->>L: POST /chat/completions
-    L->>L: async_pre_call_hook: session_id blocked? YES
-    L-->>B: 400 "Blocked by AIJudge"
-    B-->>U: error (pipeline UI: rejected at LiteLLM)
 ```
 
-## 4. Judge internals: three layers, cheapest first
+## 4. Judge internals
 
-`_handle_event` runs three checks in order, each escalating only if the
-previous one didn't reach a verdict:
+Per exchange, `_handle_event` (post-call) decides one of three paths, recorded
+as `judge_path` on the verdict and counted in `stats.json`:
 
-1. **`_nino_check`** — deterministic regex only, never touches an LLM. Two
-   independent triggers, both "bad": an actual NI-number-shaped string
-   anywhere in the exchange (a PII handling breach on its own, regardless
-   of intent), or a request to verify/validate one even without a real
-   number present. This is a compliance rule, not a judgment call, so it's
-   never left to the LLM's variance.
-2. **`_rule_check`** — a small pattern list (`SUSPICIOUS_PATTERNS`) for
-   things like "ignore previous instructions" or "reveal your system
-   prompt". A match doesn't mean "bad" — it means "escalate to the LLM
-   judge". No match means "safe" *without* spending an LLM call.
-3. **`_llm_judge`** — only reached for ambiguous cases. Calls Gemini
-   **directly** (`litellm.acompletion`, not through the local proxy), tagged
-   with `metadata={"aijudge_internal": True}`, which `_handle_event` checks
-   first thing and returns early on — this is what stops the Judge from
-   recursively logging and judging its own judgment calls.
+1. **`fast_block`** — a `block` rule fired (on the input, in the pre-call hook,
+   which records that exchange itself; or on the output). "bad", no LLM. This
+   is where the NINO compliance rule lives: deterministic, never left to the
+   LLM's variance.
+2. **`fast`** — no block and the session isn't due for review. Verdict
+   "suspicious" if any score rule fired, else "safe" — where "safe" means
+   *unreviewed*: no rule fired, the LLM never looked.
+3. **`slow`** — this exchange pushed the session over the review threshold;
+   `_slow_review` runs `_llm_judge` over the session transcript. It calls
+   Gemini **directly** (`litellm.acompletion`, not through the local proxy),
+   tagged with `metadata={"aijudge_internal": True}`, which `_handle_event`
+   checks first thing and returns early on — this is what stops the Judge
+   from recursively logging and judging its own judgment calls.
 
 The rubric explicitly judges **user intent, not assistant compliance**: a
 prompt-injection attempt that the model successfully refuses is still
@@ -169,17 +184,20 @@ crosses the blocking threshold.
 
 If the LLM judge itself returns empty content (most likely its own safety
 filter balking at the content it's reviewing), that's treated as **"bad"**
-by default — fail closed rather than silently letting it through.
+by default — fail closed. A call that *errors* or returns unparseable JSON
+is different: the verdict is "suspicious" but the review watermark is left
+alone, so the next exchange retries the review.
 
 ## 5. Key architecture decisions
 
 | Decision | Why | Tradeoff / consequence |
 |---|---|---|
-| Judging is async, after the response is sent | Hard requirement: zero added latency to any chat call | Can never block the exchange that triggered a "bad" verdict — only the next one from that session |
-| Enforcement hook is a single in-memory set lookup | Keep the one synchronous judge-adjacent code path trivial | It's a blunt yes/no; all the nuance lives in the async path |
+| The slow (LLM) tier is async, after the response is sent | Hard requirement: an LLM call must never add latency to a chat call | A slow review can never block the exchange that triggered it — only the next one from that session |
+| Fast rules run in the pre-call hook, in the request path | Deterministic regex costs microseconds and lets a `block` rule stop the current request (e.g. a pasted secret) | It is added latency, however small — so it's measured on every call and reported per session on both UIs; file I/O is kept out of it |
 | Judge calls Gemini directly, bypassing the local proxy | Avoid the Judge recursively logging/judging its own LLM-as-judge calls | Judge calls don't benefit from the proxy's own logging/retry config; guarded further by an explicit `aijudge_internal` flag |
-| Layered detection: regex first, LLM only for ambiguous cases | Cost and latency control — most traffic is obviously fine or obviously bad | Content matching no pattern is marked "safe" without ever reaching the LLM judge — a novel, unpatterned attack could slip through |
-| NINO (PII) rule is fully deterministic, no LLM involved | Compliance rules shouldn't be subject to LLM variance | Intentionally over-flags — a non-NINO string that happens to match the shape still gets blocked |
+| A per-session suspicion score gates the LLM, instead of "any regex match escalates" | Weak signals add up across turns, and the expensive LLM only runs once there's enough evidence (score climbed >= 5 since last review) | A novel attack matching no rule scores 0 and is never reviewed; exchanges no rule fired on are "safe" only in the sense of *unreviewed* |
+| Slow review judges the session transcript, not one exchange | Catches a slow build-up of individually minor probes | The transcript is in-memory only (last 6 exchanges); a proxy restart forgets it, though scores persist |
+| NINO (PII) rule is a fast `block` rule — deterministic, no LLM | Compliance rules shouldn't be subject to LLM variance | Intentionally over-flags — a non-NINO string that happens to match the shape still gets blocked |
 | Rubric scores intent, not compliance | A refused attack attempt is still an attack attempt | None — this closed a real gap found in testing |
 | Session identity is a client-generated id, not a cookie | Cookies are one-per-domain; can't run two independent sessions in one browser tab | Backend has zero server-side session state; a session is only as trustworthy as whatever the client sends |
 | No Postgres / virtual-key DB for LiteLLM's built-in admin UI | Kept the whole system to flat local JSON files, no extra infra | LiteLLM's own `/ui` admin dashboard doesn't work (it requires a DB); not needed since our own UI + blocklist file cover the same need here |
@@ -199,9 +217,16 @@ Everything the Judge sees and decides lives under `AIJUDGE_DATA_DIR`
 - `data/judge_activity.log` — human-readable trace of every exchange, every
   prompt sent to the LLM judge, its raw response, and the final verdict
   (also mirrored to the LiteLLM proxy's console)
+- `data/sessions.json` — per-session suspicion score, review watermark,
+  recent fast-rule hits, last few slow reviews, and fast-rule latency (per
+  session, plus a global total/max and the last 200 samples for the
+  dashboard's percentiles). Written by the Judge (debounced, atomically via
+  a temp file + rename); read by `chatui/backend/app.py` (per-request
+  latency, session summary) and `judge_ui/app.py`
 - `data/stats.json` — running totals only the Judge writes and only the
   Judge Dashboard reads: request count, verdict breakdown, token usage
-  (chat traffic and judge-overhead tracked separately), unique sessions
+  (chat traffic and judge-overhead tracked separately), how exchanges were
+  resolved (`judge_paths`: `fast_block` / `fast` / `slow`), unique sessions
   seen, and a rolling window of request timestamps the dashboard turns
   into requests/sec
 
@@ -215,14 +240,16 @@ ever grew one.
 
 ## 7. Known limitations
 
-- The regex filter in `_rule_check` is a small, illustrative pattern list —
-  novel attacks that match nothing in it are marked "safe" without an LLM
-  review.
+- The fast rules are a small, illustrative pattern list — novel attacks
+  that match nothing in it score 0 and are never reviewed by the LLM.
+  Exchanges no rule fired on are marked "safe" but really mean *unreviewed*.
 - Blocking is per client-chosen session id, not per-IP or per-account —
   there's no auth layer. This is a local testing setup, not a hardened
   multi-tenant deployment.
 - The NINO check is shape-based and will false-positive on non-NINO strings
   that happen to fit the pattern — an accepted tradeoff for PII handling.
 - LLM-as-judge verdicts are still probabilistic where they're used (the
-  ambiguous middle tier) — the hard rules (NINO) and the intent-based
+  slow tier) — the hard `block` rules (NINO, secrets) and the intent-based
   rubric narrow, but don't eliminate, that variance.
+- Output-side fast rules run after the response is sent, so they can only
+  affect the session's later turns.

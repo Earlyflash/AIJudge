@@ -35,6 +35,7 @@ DATA_DIR = ((REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data
 VERDICTS_DIR = DATA_DIR / "verdicts"
 BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
 STATS_PATH = DATA_DIR / "stats.json"
+SESSIONS_PATH = DATA_DIR / "sessions.json"
 
 # Window (seconds) over which requests/sec is computed — must match (or be
 # shorter than) STATS_WINDOW_SECONDS in litellm_proxy/judge_logger.py,
@@ -45,7 +46,16 @@ RPS_WINDOW_SECONDS = 60
 # <= TOKEN_BUCKET_KEEP in litellm_proxy/judge_logger.py.
 TIMELINE_MINUTES = 30
 
+# How many sessions the suspicion table lists.
+TOP_SESSIONS_SHOWN = 20
+
 app = FastAPI(title="AIJudge — Judge Dashboard")
+
+
+def _percentile(sorted_values, p):
+    if not sorted_values:
+        return 0.0
+    return sorted_values[min(len(sorted_values) - 1, int(p * len(sorted_values)))]
 
 
 @app.post("/api/blocklist/reset")
@@ -97,6 +107,45 @@ async def judge_stats():
         reverse=True,
     )[:8]
 
+    sessions_file = {}
+    if SESSIONS_PATH.exists():
+        try:
+            sessions_file = json.loads(SESSIONS_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            sessions_file = {}
+
+    # Latency the fast tier adds to the request path (its pre-call hook).
+    fl = sessions_file.get("fast_latency", {})
+    recent_latency = sorted(fl.get("recent", []))
+    fast_checks = fl.get("checks", 0)
+    fast_latency = {
+        "checks": fast_checks,
+        "avg_ms": (fl.get("total_ms", 0) / fast_checks) if fast_checks else 0,
+        "p50_ms": _percentile(recent_latency, 0.5),
+        "p95_ms": _percentile(recent_latency, 0.95),
+        "max_ms": fl.get("max_ms", 0),
+        "sample_size": len(recent_latency),
+    }
+
+    threshold = judge_rules.SLOW_REVIEW_THRESHOLD
+    sessions = []
+    for sid, s in sessions_file.get("sessions", {}).items():
+        checks = s.get("fast_checks", 0)
+        sessions.append({
+            "session_id": sid,
+            "score": s.get("score", 0),
+            "reviewed_score": s.get("reviewed_score", 0),
+            "blocked": sid in blocked_users,
+            "requests": s.get("requests", 0),
+            "fast_checks": checks,
+            "fast_latency_avg_ms": (s.get("fast_latency_total_ms", 0) / checks) if checks else 0,
+            "fast_latency_max_ms": s.get("fast_latency_max_ms", 0),
+            "recent_hits": [h["name"] for h in s.get("hits", [])[-4:]],
+            "last_review": (s.get("reviews") or [None])[-1],
+            "last_seen": s.get("last_seen", 0),
+        })
+    sessions.sort(key=lambda s: (s["blocked"], s["score"], s["last_seen"]), reverse=True)
+
     recent_verdicts = []
     if VERDICTS_DIR.exists():
         files = sorted(VERDICTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]
@@ -107,10 +156,8 @@ async def judge_stats():
                 continue
 
     return {
-        "rules": judge_rules.RULES_SUMMARY,
-        "suspicious_patterns": judge_rules.SUSPICIOUS_PATTERNS_RAW,
-        "nino_format_pattern": judge_rules.NINO_FORMAT_REGEX,
-        "nino_intent_pattern": judge_rules.NINO_VERIFY_INTENT_REGEX,
+        "fast_rules": judge_rules.FAST_RULES,
+        "slow_review": judge_rules.SLOW_REVIEW,
         "totals": {
             "total_requests": stats.get("total_requests", 0),
             "verdict_counts": stats.get("verdict_counts", {"safe": 0, "suspicious": 0, "bad": 0}),
@@ -127,7 +174,10 @@ async def judge_stats():
         "requests_per_second": round(requests_last_window / RPS_WINDOW_SECONDS, 3),
         "requests_last_window": requests_last_window,
         "window_seconds": RPS_WINDOW_SECONDS,
-        "judge_paths": stats.get("judge_paths", {"nino": 0, "rule": 0, "llm": 0}),
+        "judge_paths": stats.get("judge_paths", {"fast_block": 0, "fast": 0, "slow": 0}),
+        "fast_latency": fast_latency,
+        "slow_review_threshold": threshold,
+        "sessions": sessions[:TOP_SESSIONS_SHOWN],
         "token_timeline": token_timeline,
         "top_sessions": top_sessions,
         "blocked_users": blocked_users,

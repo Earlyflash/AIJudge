@@ -25,7 +25,7 @@
 
     <section class="panel">
       <h2>Token Consumption</h2>
-      <p class="hint">Where tokens are spent across the solution. Chat = user-facing calls through LiteLLM; Judge = the LLM-as-judge's own calls (only made when the regex filter escalates).</p>
+      <p class="hint">Where tokens are spent across the solution. Chat = user-facing calls through LiteLLM; Judge = the slow-tier LLM review's own calls (only made when a session's suspicion score crosses the threshold).</p>
       <div class="token-grid">
         <div>
           <h3>By component</h3>
@@ -47,22 +47,37 @@
       <div id="token-sessions" class="hbars"></div>
     </section>
 
+    <section class="panel">
+      <h2>Fast-rule Latency</h2>
+      <p class="hint">Time the deterministic fast rules add to a request. They run in the LiteLLM pre-call hook, so this is added latency on the request path (file writes are excluded from the measurement). Percentiles are over the most recent checks.</p>
+      <div class="kpi-row" id="latency-kpis"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Session Suspicion</h2>
+      <p class="hint" id="sessions-hint"></p>
+      <div class="table-scroll">
+        <table class="sessions-table" id="sessions-table">
+          <thead>
+            <tr><th>Session</th><th>Score</th><th>Status</th><th>Recent signals</th><th>Last review</th><th>Fast rules avg / max</th></tr>
+          </thead>
+          <tbody id="sessions-body"><tr><td colspan="6" class="empty">No sessions yet</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
     <div class="two-col">
       <section class="panel">
         <h2>Active Rules</h2>
-        <p class="hint">Evaluated in this order — the first rule to reach a verdict wins.</p>
+        <p class="hint" id="rules-hint"></p>
+        <h3>Fast &mdash; deterministic, every exchange</h3>
         <ol class="rules-list" id="rules-list"></ol>
+        <h3>Slow &mdash; LLM review</h3>
+        <ol class="rules-list" id="slow-rules-list"></ol>
 
         <details class="raw-patterns">
           <summary>Raw pattern source (regex)</summary>
-          <div class="raw-block">
-            <h3>Suspicious pattern filter</h3>
-            <ul id="raw-suspicious"></ul>
-            <h3>NINO format</h3>
-            <code id="raw-nino-format"></code>
-            <h3>NINO verify-intent</h3>
-            <code id="raw-nino-intent"></code>
-          </div>
+          <div class="raw-block" id="raw-patterns"></div>
         </details>
       </section>
 

@@ -311,3 +311,22 @@ h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 .verdict-item .meta { font-family: monospace; color: var(--muted); font-size: 0.72rem; }
 
 .empty { color: var(--muted); font-size: 0.8rem; }
+
+/* --- Fast/slow additions --- */
+
+.muted { color: var(--muted); }
+.table-scroll { overflow-x: auto; }
+.sessions-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.sessions-table th { text-align: left; color: var(--muted); font-weight: 500; font-size: 0.72rem; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.sessions-table td { padding: 0.45rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.sessions-table tr:last-child td { border-bottom: none; }
+.sessions-table .tag { display: inline-block; font-weight: 600; text-transform: uppercase; font-size: 0.68rem; padding: 0.1rem 0.4rem; border-radius: 4px; }
+.score-cell { display: flex; align-items: center; gap: 0.5rem; min-width: 7rem; }
+.score-track { flex: 1; height: 8px; background: #0f1115; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.score-fill { height: 100%; background: var(--suspicious); }
+.score-fill.hot { background: var(--bad); }
+.action-chip { display: inline-block; font-family: ui-monospace, Consolas, monospace; font-size: 0.7rem; padding: 0 0.35rem; border-radius: 4px; margin-right: 0.3rem; }
+.action-chip.block { background: rgba(224, 71, 63, 0.15); color: var(--bad); }
+.action-chip.score { background: rgba(224, 167, 47, 0.15); color: var(--suspicious); }
+.raw-block h3 { margin: 0.6rem 0 0.2rem; font-size: 0.8rem; }
+.raw-block code { display: block; word-break: break-all; }

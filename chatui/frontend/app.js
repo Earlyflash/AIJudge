@@ -23,6 +23,8 @@ class ChatPanel {
     this.captionEl = this.root.querySelector(".pipeline-caption");
     this.tokenTotalEl = this.root.querySelector(".token-total");
     this.tokenSplitEl = this.root.querySelector(".token-split");
+    this.fastLatencyEl = this.root.querySelector(".fast-latency");
+    this.fastScoreEl = this.root.querySelector(".fast-score");
     this.bannerEl = this.root.querySelector(".banner");
     this.messagesEl = this.root.querySelector(".messages");
     this.formEl = this.root.querySelector(".chat-form");
@@ -41,6 +43,7 @@ class ChatPanel {
     knownSessions[this.sessionId] = { label: this.title, accent: this.accent };
     this.tokens = { prompt: 0, completion: 0, total: 0 };
     this.renderTokens();
+    this.renderFast(null, null);
     this.sessionIdEl.textContent = `id: ${this.sessionId.slice(0, 8)}`;
     this.sessionIdEl.title = this.sessionId;
     this.messagesEl.innerHTML = "";
@@ -54,14 +57,30 @@ class ChatPanel {
     this.tokenSplitEl.textContent = `${f(this.tokens.prompt)} in / ${f(this.tokens.completion)} out`;
   }
 
-  addMessage(role, text, usage) {
+  // summary: this session's entry from /api/status (or null before its first request)
+  renderFast(summary, threshold) {
+    if (!summary || !summary.fast_checks) {
+      this.fastLatencyEl.textContent = "Fast rules: -- ms";
+      this.fastScoreEl.textContent = `Suspicion: 0/${threshold ?? 5}`;
+      return;
+    }
+    this.fastLatencyEl.textContent =
+      `Fast rules: ${fmtMs(summary.fast_latency_last_ms)} last · ${fmtMs(summary.fast_latency_avg_ms)} avg · ${fmtMs(summary.fast_latency_max_ms)} max (${summary.fast_checks})`;
+    this.fastScoreEl.textContent = `Suspicion: ${summary.score}/${threshold ?? 5}`;
+    this.fastScoreEl.classList.toggle("hot", threshold != null && summary.score >= threshold);
+  }
+
+  addMessage(role, text, usage, fastMs) {
     const div = document.createElement("div");
     div.className = `msg ${role}`;
     div.textContent = text;
-    if (usage) {
+    if (usage || fastMs != null) {
       const meta = document.createElement("div");
       meta.className = "msg-tokens";
-      meta.textContent = `${usage.prompt_tokens} in / ${usage.completion_tokens} out · ${usage.total_tokens} tokens`;
+      const parts = [];
+      if (usage) parts.push(`${usage.prompt_tokens} in / ${usage.completion_tokens} out · ${usage.total_tokens} tokens`);
+      if (fastMs != null) parts.push(`fast rules ${fmtMs(fastMs)}`);
+      meta.textContent = parts.join(" · ");
       div.appendChild(meta);
     }
     this.messagesEl.appendChild(div);
@@ -104,7 +123,7 @@ class ChatPanel {
           blocked ? `Blocked by Judge (${elapsed}ms)` : `Error (${elapsed}ms)`,
           blocked ? "litellm" : "backend"
         );
-        this.addMessage("error", data.error || `Request failed (${resp.status})`);
+        this.addMessage("error", data.error || `Request failed (${resp.status})`, null, data.fast_check_ms);
         this.bannerEl.classList.toggle("hidden", !blocked);
         if (blocked) this.bannerEl.textContent = "This session has been blocked by AIJudge.";
       } else {
@@ -116,7 +135,7 @@ class ChatPanel {
           this.tokens.total += usage.total_tokens;
           this.renderTokens();
         }
-        this.addMessage("assistant", data.reply, usage);
+        this.addMessage("assistant", data.reply, usage, data.fast_check_ms);
       }
     } catch (err) {
       this.setPipeline("error", "Network error", "backend");
@@ -134,6 +153,13 @@ class ChatPanel {
   }
 }
 
+// Fast-rule checks take well under a millisecond, so show more precision
+// than a whole-ms round trip would.
+function fmtMs(ms) {
+  if (ms == null) return "--";
+  return ms < 1 ? `${ms.toFixed(3)} ms` : ms < 100 ? `${ms.toFixed(2)} ms` : `${Math.round(ms)} ms`;
+}
+
 const panelA = new ChatPanel("panel-a-slot", "a", "Session A");
 const panelB = new ChatPanel("panel-b-slot", "b", "Session B");
 const panels = [panelA, panelB];
@@ -145,7 +171,10 @@ function sessionLabel(userId) {
 }
 
 function renderStatus(status) {
-  for (const panel of panels) panel.isBlocked(status.blocked_users);
+  for (const panel of panels) {
+    panel.isBlocked(status.blocked_users);
+    panel.renderFast((status.sessions || {})[panel.sessionId] || null, status.slow_review_threshold);
+  }
 
   blockedListEl.innerHTML = "";
   if (status.blocked_users.length === 0) {
@@ -173,7 +202,7 @@ function renderStatus(status) {
         <span class="tag ${tagClass}">${v.verdict || "unknown"}</span>
         <div class="reason">${v.reason || ""}</div>
         <div class="user"><span class="session-swatch" style="background:${color}"></span>${text} &middot; ${new Date(v.timestamp).toLocaleTimeString()}</div>
-        <div class="user">chat ${v.chat_tokens ?? 0} tok &middot; judge ${v.judge_tokens ?? 0} tok</div>
+        <div class="user">chat ${v.chat_tokens ?? 0} tok &middot; judge ${v.judge_tokens ?? 0} tok${v.fast_latency_ms != null ? ` &middot; fast ${fmtMs(v.fast_latency_ms)}` : ""}</div>
       `;
       verdictListEl.appendChild(li);
     }

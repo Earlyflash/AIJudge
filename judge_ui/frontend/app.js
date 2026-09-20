@@ -2,9 +2,12 @@ const kpiRowEl = document.getElementById("kpi-row");
 const stackbarEl = document.getElementById("stackbar");
 const stackbarLegendEl = document.getElementById("stackbar-legend");
 const rulesListEl = document.getElementById("rules-list");
-const rawSuspiciousEl = document.getElementById("raw-suspicious");
-const rawNinoFormatEl = document.getElementById("raw-nino-format");
-const rawNinoIntentEl = document.getElementById("raw-nino-intent");
+const slowRulesListEl = document.getElementById("slow-rules-list");
+const rulesHintEl = document.getElementById("rules-hint");
+const rawPatternsEl = document.getElementById("raw-patterns");
+const latencyKpisEl = document.getElementById("latency-kpis");
+const sessionsHintEl = document.getElementById("sessions-hint");
+const sessionsBodyEl = document.getElementById("sessions-body");
 const blockedListEl = document.getElementById("blocked-list");
 const verdictListEl = document.getElementById("verdict-list");
 const resetBlocklistBtn = document.getElementById("reset-blocklist-btn");
@@ -24,6 +27,81 @@ let lastBlockedCount = 0;
 
 function fmtNumber(n) {
   return new Intl.NumberFormat().format(n || 0);
+}
+
+function esc(str) {
+  return String(str ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Fast-rule checks take well under a millisecond.
+function fmtMs(ms) {
+  if (ms == null) return "--";
+  return ms < 1 ? `${ms.toFixed(3)} ms` : ms < 100 ? `${ms.toFixed(2)} ms` : `${Math.round(ms)} ms`;
+}
+
+function kpiTiles(tiles) {
+  return tiles
+    .map(
+      (tile) => `
+      <div class="kpi-tile${tile.status ? ` status-${tile.status}` : ""}">
+        <div class="kpi-label">${tile.label}</div>
+        <div class="kpi-value">${tile.value}</div>
+        ${tile.sub ? `<div class="kpi-sub">${tile.sub}</div>` : ""}
+      </div>`
+    )
+    .join("");
+}
+
+function renderLatency(data) {
+  const l = data.fast_latency;
+  if (!l.checks) {
+    latencyKpisEl.innerHTML = '<div class="empty">No requests checked yet</div>';
+    return;
+  }
+  latencyKpisEl.innerHTML = kpiTiles([
+    { label: "Average", value: fmtMs(l.avg_ms), sub: `${fmtNumber(l.checks)} checks` },
+    { label: "Median", value: fmtMs(l.p50_ms), sub: `last ${l.sample_size}` },
+    { label: "95th percentile", value: fmtMs(l.p95_ms), sub: `last ${l.sample_size}` },
+    { label: "Slowest", value: fmtMs(l.max_ms), sub: "since first check" },
+  ]);
+}
+
+function renderSessions(data) {
+  const threshold = data.slow_review_threshold;
+  sessionsHintEl.textContent =
+    `Each fast-rule hit adds to a session's score (minor +1, major +5); a block rule stops the session outright. ` +
+    `When a session's score has climbed ${threshold} since its last review, the LLM reviews the whole session.`;
+  if (data.sessions.length === 0) {
+    sessionsBodyEl.innerHTML = '<tr><td colspan="6" class="empty">No sessions yet</td></tr>';
+    return;
+  }
+  sessionsBodyEl.innerHTML = data.sessions
+    .map((s) => {
+      const pending = s.score - s.reviewed_score;
+      const pct = Math.min(100, (pending / threshold) * 100);
+      const status = s.blocked
+        ? '<span class="tag bad">blocked</span>'
+        : pending >= threshold
+        ? '<span class="tag suspicious">review due</span>'
+        : '<span class="tag safe">active</span>';
+      const r = s.last_review;
+      const review = r
+        ? `<span class="tag ${["safe", "suspicious", "bad"].includes(r.verdict) ? r.verdict : "suspicious"}">${esc(r.verdict)}</span> <span class="muted" title="${esc(r.reason)}">at score ${r.score_at_review}</span>`
+        : '<span class="muted">&mdash;</span>';
+      return `
+        <tr>
+          <td title="${esc(s.session_id)}"><code>${esc(s.session_id.slice(0, 8))}</code></td>
+          <td>
+            <div class="score-cell"><div class="score-track"><div class="score-fill${pending >= threshold ? " hot" : ""}" style="width:${pct}%"></div></div>
+            <span>${s.score}</span></div>
+          </td>
+          <td>${status}</td>
+          <td class="muted">${s.recent_hits.length ? esc(s.recent_hits.join(", ")) : "&mdash;"}</td>
+          <td>${review}</td>
+          <td class="muted">${fmtMs(s.fast_latency_avg_ms)} / ${fmtMs(s.fast_latency_max_ms)}</td>
+        </tr>`;
+    })
+    .join("");
 }
 
 function renderKpis(data) {
@@ -47,23 +125,18 @@ function renderKpis(data) {
       sub: `${fmtNumber(t.total_prompt_tokens)} prompt / ${fmtNumber(t.total_completion_tokens)} completion`,
     },
     {
+      label: "Fast-rule Latency (avg)",
+      value: fmtMs(data.fast_latency.avg_ms),
+      sub: `p95 ${fmtMs(data.fast_latency.p95_ms)} · ${fmtNumber(data.fast_latency.checks)} checks`,
+    },
+    {
       label: "Judge Overhead Tokens",
       value: fmtNumber(t.judge_overhead_tokens),
       sub: `${fmtNumber(t.judge_prompt_tokens)} prompt / ${fmtNumber(t.judge_completion_tokens)} completion`,
     },
   ];
 
-  kpiRowEl.innerHTML = tiles
-    .map(
-      (tile) => `
-      <div class="kpi-tile${tile.status ? ` status-${tile.status}` : ""}">
-        <div class="kpi-label">${tile.label}</div>
-        <div class="kpi-value">${tile.value}</div>
-        ${tile.sub ? `<div class="kpi-sub">${tile.sub}</div>` : ""}
-      </div>
-    `
-    )
-    .join("");
+  kpiRowEl.innerHTML = kpiTiles(tiles);
 }
 
 function renderStackbar(data) {
@@ -190,17 +263,17 @@ function renderTokens(data) {
     pathBarEl,
     pathLegendEl,
     [
-      { label: "NINO rule (0 tokens)", cls: "nino", value: p.nino || 0 },
-      { label: "Regex safe-pass (0 tokens)", cls: "rule", value: p.rule || 0 },
-      { label: "LLM judge", cls: "llm", value: p.llm || 0 },
+      { label: "Blocked by fast rule (0 tokens)", cls: "nino", value: p.fast_block || 0 },
+      { label: "Fast rules only (0 tokens)", cls: "rule", value: p.fast || 0 },
+      { label: "Slow LLM review", cls: "llm", value: p.slow || 0 },
     ],
     "No requests judged yet"
   );
   const avg = t.judge_calls ? Math.round(t.judge_overhead_tokens / t.judge_calls) : 0;
   const ratio = t.total_tokens ? ((t.judge_overhead_tokens / t.total_tokens) * 100).toFixed(1) : "0.0";
   pathNoteEl.textContent = t.judge_calls
-    ? `${fmtNumber(t.judge_calls)} LLM judge calls averaging ${fmtNumber(avg)} tokens each. Judge overhead is ${ratio}% of chat tokens.`
-    : "No LLM judge calls yet — every exchange was resolved by deterministic rules.";
+    ? `${fmtNumber(t.judge_calls)} slow reviews averaging ${fmtNumber(avg)} tokens each. Judge overhead is ${ratio}% of chat tokens.`
+    : "No slow LLM reviews yet — every exchange was resolved by the deterministic fast rules.";
 
   renderTimeline(data);
 
@@ -219,27 +292,44 @@ function renderTokens(data) {
   );
 }
 
+function ruleAction(r) {
+  return r.action === "block" ? "block" : `+${r.points}`;
+}
+
 function renderRulesOnce(data) {
   if (rulesRendered) return;
   rulesRendered = true;
 
-  rulesListEl.innerHTML = data.rules
+  const slow = data.slow_review;
+  rulesHintEl.textContent =
+    `Every fast rule that matches counts: a block rule blocks the session, score rules add points. ` +
+    `Slow review runs when a session's score has climbed ${slow.threshold} since its last review.`;
+
+  rulesListEl.innerHTML = data.fast_rules
     .map(
       (r) => `
       <li>
         <div class="rule-head">
-          <span class="rule-name">${r.name}</span>
-          <span class="rule-mode">${r.mode}</span>
+          <span class="rule-name">${esc(r.name)}</span>
+          <span class="rule-mode"><span class="action-chip ${r.action}">${ruleAction(r)}</span> ${esc(r.scope)}</span>
         </div>
-        <div class="rule-desc">${r.description}</div>
-      </li>
-    `
+        <div class="rule-desc">${esc(r.description)}</div>
+      </li>`
     )
     .join("");
 
-  rawSuspiciousEl.innerHTML = data.suspicious_patterns.map((p) => `<li>${p}</li>`).join("");
-  rawNinoFormatEl.textContent = data.nino_format_pattern;
-  rawNinoIntentEl.textContent = data.nino_intent_pattern;
+  slowRulesListEl.innerHTML = `
+    <li>
+      <div class="rule-head">
+        <span class="rule-name">${esc(slow.name)}</span>
+        <span class="rule-mode">score &ge; ${slow.threshold} since last review</span>
+      </div>
+      <div class="rule-desc">${esc(slow.description)}</div>
+    </li>`;
+
+  rawPatternsEl.innerHTML = data.fast_rules
+    .map((r) => `<h3>${esc(r.name)}${r.validator ? ` <span class="muted">(+ ${esc(r.validator)} check)</span>` : ""}</h3><code>${esc(r.pattern)}</code>`)
+    .join("");
 }
 
 function renderBlocked(data) {
@@ -295,6 +385,8 @@ async function pollStats() {
     const resp = await fetch("/api/judge-stats");
     const data = await resp.json();
     renderKpis(data);
+    renderLatency(data);
+    renderSessions(data);
     renderStackbar(data);
     renderTokens(data);
     renderRulesOnce(data);

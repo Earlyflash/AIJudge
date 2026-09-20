@@ -39,12 +39,33 @@ _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
 DATA_DIR = ((REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")).resolve()
 VERDICTS_DIR = DATA_DIR / "verdicts"
 BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
+SESSIONS_PATH = DATA_DIR / "sessions.json"
 
 LITELLM_BASE = os.environ.get("AIJUDGE_LITELLM_BASE", "http://localhost:4000")
 LITELLM_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 CHAT_MODEL = os.environ.get("AIJUDGE_CHAT_MODEL", "gemini-flash")
 
 app = FastAPI(title="AIJudge")
+
+
+def _read_sessions():
+    """Per-session suspicion score and fast-rule latency, written by the
+    Judge (data/sessions.json). Missing/partial file just means no data."""
+    try:
+        return json.loads(SESSIONS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _session_summary(session):
+    checks = session.get("fast_checks", 0)
+    return {
+        "score": session.get("score", 0),
+        "fast_checks": checks,
+        "fast_latency_last_ms": session.get("last_fast_latency_ms", 0),
+        "fast_latency_avg_ms": (session.get("fast_latency_total_ms", 0) / checks) if checks else 0,
+        "fast_latency_max_ms": session.get("fast_latency_max_ms", 0),
+    }
 
 
 class ChatRequest(BaseModel):
@@ -76,10 +97,15 @@ async def chat(req: ChatRequest):
         return JSONResponse(status_code=502, content={"error": f"Could not reach LiteLLM proxy: {e}"})
     latency_ms = round((time.monotonic() - start) * 1000)
 
+    # The Judge's pre-call fast rules ran (and wrote their timing) before the
+    # response came back, so this is the latency for *this* request.
+    session = _read_sessions().get("sessions", {}).get(session_id, {})
+    fast_check_ms = session.get("last_fast_latency_ms")
+
     if resp.status_code >= 400:
         return JSONResponse(
             status_code=resp.status_code,
-            content={"error": resp.text, "latency_ms": latency_ms},
+            content={"error": resp.text, "latency_ms": latency_ms, "fast_check_ms": fast_check_ms},
         )
 
     data = resp.json()
@@ -89,6 +115,7 @@ async def chat(req: ChatRequest):
         "reply": reply,
         "session_id": session_id,
         "latency_ms": latency_ms,
+        "fast_check_ms": fast_check_ms,
         "usage": {
             "prompt_tokens": usage.get("prompt_tokens") or 0,
             "completion_tokens": usage.get("completion_tokens") or 0,
@@ -112,9 +139,12 @@ async def status():
             except json.JSONDecodeError:
                 continue
 
+    sessions_file = _read_sessions()
     return {
         "blocked_users": blocked_users,
         "recent_verdicts": recent_verdicts,
+        "slow_review_threshold": sessions_file.get("slow_review_threshold"),
+        "sessions": {sid: _session_summary(s) for sid, s in sessions_file.get("sessions", {}).items()},
     }
 
 

@@ -184,6 +184,8 @@ h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; colo
   margin-bottom: 0.6rem;
 }
 .token-meter .token-total { color: var(--text); font-weight: 600; }
+.fast-meter { margin-top: 0.25rem; }
+.fast-meter .fast-score.hot { color: var(--bad); font-weight: 600; }
 .msg-tokens { font-size: 0.68rem; color: var(--muted); margin-top: 0.3rem; }
 
 /* --- Chat --- */

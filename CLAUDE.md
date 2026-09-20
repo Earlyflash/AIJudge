@@ -78,9 +78,11 @@ it was pulled back out) — the dashboard is meant to work as a standalone
 admin/compliance view of what the Judge is doing, usable with or without
 the chat test UI running at all.
 
-Its main route, `/api/judge-stats`, returns: `judge_rules.RULES_SUMMARY`
-plus the raw regex sources (for full transparency about what's actually
-enforced — see `judge_rules.py`), aggregate totals from `data/stats.json`
+Its main route, `/api/judge-stats`, returns: `judge_rules.FAST_RULES` (with
+their raw regex sources, for full transparency about what's actually
+enforced) and `judge_rules.SLOW_REVIEW`, `fast_latency` (avg/p50/p95/max of
+what the fast tier adds to the request path), the per-session suspicion
+table, aggregate totals from `data/stats.json`
 (requests, verdict counts, token usage split into chat vs. judge-overhead,
 unique session count), a derived `requests_per_second` (see below), the
 current blocklist, and up to 50 recent verdicts.
@@ -112,21 +114,41 @@ config reference, **the LiteLLM proxy must be started with
 this via `Push-Location`; don't move `config.yaml` and `judge_logger.py`
 apart or break that cwd assumption without updating the callback path.
 
-It has two responsibilities on deliberately different timelines — this
-split is the load-bearing design decision of the whole project, driven by
-a hard requirement that judging must never add latency to a chat call:
+Two tiers, split by cost and certainty. The hard requirement behind the
+split: **an LLM call must never add latency to a chat call.**
 
-- **Enforcement** — `async_pre_call_hook`, runs synchronously in the
-  request path before every call. Kept to a single in-memory set lookup
-  against the blocklist on purpose. It can only reject a call based on a
-  verdict from a *previous* exchange, never the current one.
-- **Judging** — `async_log_success_event` / `async_log_failure_event`,
-  fired via `asyncio.create_task` *after* the response has already gone
-  back to the caller. Writes the full exchange to `data/logs/`, runs a
-  cheap regex filter (`SUSPICIOUS_PATTERNS`) first, and only escalates
-  ambiguous matches to an LLM-as-judge Gemini call (`_llm_judge`). A
-  "bad" verdict appends the user id to `data/blocked_users.json`, which
-  enforcement reads (with an mtime check to pick up out-of-process writes).
+- **Fast** — deterministic rules from `judge_rules.FAST_RULES` (regex, plus
+  an optional named validator such as Luhn). Input rules run in
+  `async_pre_call_hook`, *in the request path*, so a `block` rule rejects
+  the current request. A `score` rule adds its `points` to the session's
+  suspicion score instead. Output rules run in `_handle_event`, after the
+  response has gone back. The hook times its own work
+  (`time.perf_counter`) and stores it per session and globally — keep it
+  that way: `_fast_precheck` must stay **in-memory only** (no file I/O), and
+  file writes (`sessions.json` via the debounced `_schedule_persist`, the
+  blocklist file, exchange records) must stay outside the timed window,
+  otherwise the reported "latency added by the fast rules" is a lie.
+- **Slow** — the LLM judge, `_slow_review` → `_llm_judge`. Only runs from
+  `_handle_event` (async, after the response) when
+  `score - reviewed_score >= judge_rules.SLOW_REVIEW_THRESHOLD`. It reviews
+  the session's recent transcript (in memory, `_transcripts`) plus the fast
+  rules that fired. `bad` blocks the session; `safe` subtracts the reviewed
+  score and resets the watermark; `suspicious` sets the watermark to the
+  score reviewed (so it needs another threshold's worth before re-review); a
+  call *error* leaves the watermark alone so the next exchange retries.
+  Content that fires no rule is verdict "safe" but means *unreviewed* — an
+  intentional cost/coverage tradeoff (README "Known limitations"), not
+  something to "fix" by sending everything to the LLM.
+
+Per-session state (score, watermark, hits, reviews, latency counters) lives
+in `JudgeLogger._sessions`, mirrored to `data/sessions.json`. All access is
+synchronous on the event loop, so there is no locking; keep it that way (no
+`await` in the middle of a read-modify-write of it). Pre-call results are
+handed to the post-call event through `_pending` (per-session FIFO), because
+the pre-call and post-call hooks share no other channel. A request rejected
+in the pre-call hook never gets a matching post-call event
+(`_record_blocked_exchange` records it instead), and `_handle_event`
+returns early on a failure event with no pending entry for that reason.
 
 The LLM-as-judge call in `_llm_judge` calls Gemini **directly** via
 `litellm.acompletion`, bypassing the local proxy, and tags itself with
@@ -135,29 +157,24 @@ returns early — this is what stops the Judge from recursively logging and
 judging its own judgment calls. Preserve both sides of that guard if you
 touch this file.
 
-If you change the pattern lists, edit them in `judge_rules.py`, not
-`judge_logger.py` — the latter now just compiles what `judge_rules.py`
-defines (`SUSPICIOUS_PATTERNS = [re.compile(p, re.I) for p in
-judge_rules.SUSPICIOUS_PATTERNS_RAW]`), and `judge_ui/app.py` reads that
-same module to display them on the dashboard. Editing a compiled pattern
-in `judge_logger.py` directly would desync it from what the dashboard
-shows. Content that matches no pattern is marked "safe" without ever
-reaching the LLM judge — an intentional cost/coverage tradeoff (see README
-"Known limitations"), not an oversight to "fix" by removing the fast path.
+Rules, weights (`POINTS_MINOR`/`POINTS_MAJOR`) and the review threshold live
+in `judge_rules.py`, not `judge_logger.py` — the latter only compiles what
+`judge_rules.FAST_RULES` defines, and `judge_ui/app.py` serves that same
+data to the dashboard. Editing rules anywhere else would desync the
+dashboard from what's enforced. `FAST_RULES` must stay JSON-serialisable
+(validators are referenced by name via `VALIDATORS`). All patterns compile
+case-insensitive; use an inline `(?-i:...)` group for a case-sensitive token
+(see the `DAN` pattern, which must not match the name "Dan").
 
-`_nino_check` (checked before `_rule_check`, patterns from
-`judge_rules.py`'s `NINO_FORMAT_REGEX` / `NINO_VERIFY_INTENT_REGEX`) is a
-separate, harder rule: UK National Insurance Number handling is a
-compliance requirement, not a judgment call, so it never reaches the LLM
-judge at all — deterministic regex only. It fires "bad" on either (1) an
-actual NI-number-shaped string anywhere in the input or output (treated as
-a PII handling breach on its own, regardless of surrounding context or
-intent), or (2) a request to verify/validate/check a NI number even with
-no real-looking number present. This deliberately over-flags — a string
-that merely has the right shape (two letters, six digits, one suffix
-letter) but isn't really a NINO (e.g. some other reference code) still
-gets blocked. That's intentional: for PII, false positives are the safe
-failure mode here.
+The NINO rules (`nino-format`, `nino-verify-intent`) are `block` rules on
+purpose: UK National Insurance Number handling is a compliance requirement,
+not a judgment call, so it never reaches the LLM — deterministic regex only.
+It fires on either (1) an NI-number-shaped string anywhere in the input or
+output (a PII handling breach on its own, whatever the intent), or (2) a
+request to verify/validate/check a NI number even with no real-looking
+number present. It deliberately over-flags — a string with the right shape
+(two letters, six digits, one suffix letter) that isn't really a NINO still
+blocks. For PII, false positives are the safe failure mode.
 
 ### Data (`data/`, gitignored, path overridable via `AIJUDGE_DATA_DIR`)
 
@@ -171,6 +188,15 @@ failure mode here.
 - `data/judge_activity.log` — every exchange, judge prompt, judge raw
   response, and final verdict, via the `aijudge` logger in
   `judge_logger.py` (also mirrored to the LiteLLM proxy's console)
+- `data/sessions.json` — per-session suspicion score, review watermark,
+  recent fast-rule hits, last slow reviews, and fast-rule latency (per
+  session + a global total/max and the last 200 samples). Written by
+  `judge_logger.py` (debounced, temp file + `os.replace`); read by
+  `chatui/backend/app.py` (the per-request `fast_check_ms` echoed to the
+  browser, and a session summary in `/api/status`) and `judge_ui/app.py`
+  (`fast_latency` percentiles and the session suspicion table). Verdict
+  files also carry `fast_latency_ms`, `fast_rules`, `points`,
+  `session_score`.
 - `data/stats.json` — running totals only `judge_logger.py` writes to and
   only `judge_ui/app.py` reads: `total_requests`, `verdict_counts`, token
   usage (`total_prompt_tokens`/`total_completion_tokens`/`total_tokens`,
@@ -179,8 +205,8 @@ failure mode here.
   `recent_timestamps` (rolling window, trimmed to `STATS_WINDOW_SECONDS` on
   every write, that the dashboard turns into requests/sec). Token
   attribution also lives here: `judge_prompt_tokens`/`judge_completion_tokens`/
-  `judge_calls`, `judge_paths` (how each exchange was resolved: `nino` /
-  `rule` / `llm` — only `llm` costs tokens), `token_buckets` (per-minute
+  `judge_calls`, `judge_paths` (how each exchange was resolved: `fast_block` /
+  `fast` / `slow` — only `slow` costs tokens), `token_buckets` (per-minute
   chat vs judge totals, last 60 minutes, drives the dashboard timeline) and
   `session_tokens` (per-session chat/judge totals). Verdict files also carry
   `chat_tokens`, `judge_tokens` and `judge_path`. All updates go
