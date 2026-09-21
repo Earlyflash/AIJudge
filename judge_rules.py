@@ -142,13 +142,34 @@ FAST_RULES = [
     {
         "id": "injection-override",
         "name": "Instruction override",
-        "description": "“Ignore/disregard previous instructions” phrasing, or a request to reveal the instructions/prompt/rules.",
+        "description": (
+            "“Ignore/disregard/forget/override … previous/all/your … instructions/prompts/rules” "
+            "phrasing (any wording in between), or a request to reveal the instructions/prompt/rules."
+        ),
         "scope": "input",
         "action": "score",
         "points": POINTS_MAJOR,
         "pattern": (
-            r"(?:ignore|disregard) (?:all|previous|above|prior) instructions"
+            r"\b(?:ignore|disregard|forget|override|bypass)\b.{0,40}"
+            r"\b(?:previous|prior|above|earlier|preceding|all|any|your|system)\b.{0,30}"
+            r"\b(?:instructions?|prompts?|rules?|guidelines?|directives?)\b"
             r"|reveal your (?:instructions|prompt|rules)"
+        ),
+    },
+    {
+        "id": "secret-exfiltration",
+        "name": "Secret extraction request",
+        "description": (
+            "Asks the model to output/reveal/list API keys, secrets, passwords or credentials. "
+            "Can false-positive on innocent how-to questions, which is why it only scores "
+            "(triggering a slow review) rather than blocks."
+        ),
+        "scope": "input",
+        "action": "score",
+        "points": POINTS_MAJOR,
+        "pattern": (
+            r"\b(?:output|print|show|reveal|give|list|dump|leak|send|tell|expose|display)\b.{0,40}"
+            r"\b(?:api[\s_-]?keys?|secrets?|passwords?|credentials?|private keys?|access keys?)\b"
         ),
     },
     {
@@ -176,7 +197,7 @@ FAST_RULES = [
         "scope": "input",
         "action": "score",
         "points": POINTS_MINOR,
-        "pattern": r"api[_-]?key",
+        "pattern": r"api[\s_-]?keys?",
     },
     {
         "id": "persona-request",
