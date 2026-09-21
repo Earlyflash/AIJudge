@@ -48,8 +48,8 @@ The LiteLLM proxy runs a custom callback, `litellm_proxy/judge_logger.py`
   "safe" resets its score to 0, "suspicious" keeps the score and waits for
   another 5 points before reviewing again.
 
-Everything is written to `data/` (logs, verdicts, blocklist, per-session
-scores) and to `data/judge_activity.log` / the proxy's console.
+Everything is written to `data/` (logs, verdicts, and a SQLite database
+holding the blocklist, per-session scores and running stats) and to `data/judge_activity.log` / the proxy's console.
 
 The frontend has two independent chat panels ("Session A" / "Session B"),
 each generating its own random session id client-side (not a cookie) and
@@ -119,15 +119,18 @@ Everything the Judge sees and decides is written under `AIJUDGE_DATA_DIR`
 
 - `data/logs/<id>.json` — every request/response pair
 - `data/verdicts/<id>.json` — the Judge's verdict for that pair
-- `data/blocked_users.json` — session ids currently blocked
+- `data/aijudge.db` — SQLite (WAL) shared by all three processes via
+  `judge_store.py`: the `blocked` table (session ids currently blocked), the
+  `sessions` table (per-session suspicion score, fast-rule hits, slow reviews,
+  fast-rule latency counters) and a `kv` table (global fast-rule latency,
+  running stats). Older `blocked_users.json` / `sessions.json` / `stats.json`
+  files are imported once on first start and renamed `*.migrated`.
 - `data/judge_activity.log` — human-readable log of every exchange, judge
   prompt/response, and verdict (also printed to the LiteLLM proxy's console)
-- `data/sessions.json` — per-session suspicion score, fast-rule hits, slow
-  reviews, and fast-rule latency (per session and overall); read by both UIs
-- `data/stats.json` — running totals the Judge Dashboard reads: request
-  count, verdict breakdown, token usage (chat + judge overhead separately),
-  unique sessions seen, and a rolling window of recent timestamps used to
-  derive requests/sec
+  The stats document holds what the Judge Dashboard reads: request count,
+  verdict breakdown, token usage (chat + judge overhead separately), unique
+  sessions seen, and a rolling window of recent timestamps used to derive
+  requests/sec.
 
 Point `AIJUDGE_DATA_DIR` at any local path/drive to change where this lives.
 
@@ -168,7 +171,7 @@ below).
   shown on both UIs (the LLM tier adds none).
 - The slow review's transcript is held in the Judge process's memory (the
   last few exchanges per session). A proxy restart forgets it; suspicion
-  scores survive, since they're persisted in `data/sessions.json`.
+  scores survive, since they're persisted in `data/aijudge.db`.
 - Blocking is per client-chosen session id, not per-IP or per-account —
   clicking "New Session" (or just regenerating the id) gets a new, unblocked
   session. There's no user auth layer here; this is a local testing setup,

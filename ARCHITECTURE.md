@@ -48,7 +48,7 @@ flowchart LR
 
     RULES["judge_rules.py<br/>(shared, no side effects)"]
     G[("Gemini API")]
-    DATA[("data/ on local disk<br/>logs, verdicts, stats.json,<br/>sessions.json, blocked_users.json")]
+    DATA[("data/ on local disk<br/>logs, verdicts,<br/>aijudge.db (SQLite)")]
 
     A -- "POST /api/chat<br/>{session_id, message}" --> BE
     B -- "POST /api/chat<br/>{session_id, message}" --> BE
@@ -76,13 +76,13 @@ intentional, not an omission (see §5).
 | Component | File(s) | Responsibility |
 |---|---|---|
 | Frontend (chat UI) | `chatui/frontend/index.html`, `app.js`, `style.css` | Two `ChatPanel` instances, each owning its own client-generated session id; polls `/api/status` for shared judge activity; animates a request pipeline per panel; shows each session's fast-rule latency and suspicion score. |
-| Chat UI backend | `chatui/backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; reads `data/sessions.json` to echo each request's fast-rule latency (`fast_check_ms`); exposes a lightweight `/api/status` (verdicts, blocklist, per-session summary) for its own sidebar. |
+| Chat UI backend | `chatui/backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; reads the session store to echo each request's fast-rule latency (`fast_check_ms`); exposes a lightweight `/api/status` (verdicts, blocklist, per-session summary) for its own sidebar. |
 | LiteLLM proxy | `litellm_proxy/config.yaml` | Declares the `gemini-flash` model and registers the Judge callback. |
-| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback: the fast tier in the pre-call hook (plus output rules post-call) and the slow LLM review post-call (see §3); writes `data/sessions.json`, `data/stats.json`, logs, verdicts and the blocklist. |
+| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback: the fast tier in the pre-call hook (plus output rules post-call) and the slow LLM review post-call (see §3); writes the SQLite store (`data/aijudge.db`: sessions, stats, blocklist), logs and verdicts. |
 | Shared rules | `judge_rules.py` (repo root) | Side-effect-free fast rules (regex + validators, actions and weights), the slow-review threshold and description — the single source of truth for what's actually enforced, read by both the Judge and the dashboard. |
 | Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view (plus the blocklist reset): fast and slow rules, fast-rule latency, per-session suspicion scores, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
 | Red-team corpus | `tests/redteam_corpus.py` | Scores attack and benign prompts with the real fast-tier code and reports catches vs misses; a measuring tool, not a pass/fail suite. |
-| Data store | `data/` (gitignored) | The only shared state across all three Python processes — flat JSON files and a log file, no database. |
+| Data store | `data/` (gitignored) | The only shared state across all three Python processes — one shared SQLite database (`aijudge.db`, WAL) via `judge_store.py`, plus per-exchange log/verdict files and a log file. |
 
 ## 3. The core design decision: a fast tier and a slow tier
 
@@ -112,10 +112,10 @@ instructions") is +5 and triggers review alone.
 
 **The fast tier's added latency is measured, not assumed.**
 `async_pre_call_hook` times its own work with `time.perf_counter` — the
-blocklist check (a `stat` of the blocklist file, re-read only if it
-changed, then a set lookup), the regex scan of the newest user message, and
+blocklist check (one indexed SQLite point read, so a dashboard reset is
+seen immediately), the regex scan of the newest user message, and
 the in-memory score update — and records it per session and globally
-(`data/sessions.json`; the chat backend echoes the per-request figure as
+(the `sessions` table in `data/aijudge.db`; the chat backend echoes the per-request figure as
 `fast_check_ms`, and both UIs show it). All file *writes* are deliberately
 outside the measured window and off the request path: session state lives
 in memory and is flushed to disk by a debounced timer (immediately, on a
@@ -145,7 +145,7 @@ sequenceDiagram
     else score rules add to the session's suspicion score
         L->>G: completion request
         G-->>L: response
-        L-->>B: response (+ fast_check_ms via sessions.json)
+        L-->>B: response (+ fast_check_ms via the session store)
         B-->>U: reply
         L--)J: async_log_success_event (AFTER response sent)
         J->>J: FAST rules on the output, update score
@@ -155,7 +155,7 @@ sequenceDiagram
         end
         J->>J: write request + verdict + session state to data/
         alt fast block on output, or slow verdict == "bad"
-            J->>J: add session_id to blocked_users.json
+            J->>J: add session_id to the blocked table
         end
     end
 ```
@@ -163,7 +163,7 @@ sequenceDiagram
 ## 4. Judge internals
 
 Per exchange, `_handle_event` (post-call) decides one of three paths, recorded
-as `judge_path` on the verdict and counted in `stats.json`:
+as `judge_path` on the verdict and counted in the stats document:
 
 1. **`fast_block`** — a `block` rule fired (on the input, in the pre-call hook,
    which records that exchange itself; or on the output). "bad", no LLM. This
@@ -204,14 +204,14 @@ alone, so the next exchange retries the review.
 | Decision | Why | Tradeoff / consequence |
 |---|---|---|
 | The slow (LLM) tier is async, after the response is sent | Hard requirement: an LLM call must never add latency to a chat call | A slow review can never block the exchange that triggered it — only the next one from that session |
-| Fast rules run in the pre-call hook, in the request path | Deterministic regex costs microseconds and lets a `block` rule stop the current request (e.g. a pasted secret) | It is added latency, however small — so it's measured on every call and reported per session on both UIs; file writes are kept out of it (the blocklist `stat` is not) |
+| Fast rules run in the pre-call hook, in the request path | Deterministic regex costs microseconds and lets a `block` rule stop the current request (e.g. a pasted secret) | It is added latency, however small — so it's measured on every call and reported per session on both UIs; store writes are kept out of it (the indexed blocklist read is not) |
 | Judge calls Gemini directly, bypassing the local proxy | Avoid the Judge recursively logging/judging its own LLM-as-judge calls | Judge calls don't benefit from the proxy's own logging/retry config; guarded further by an explicit `aijudge_internal` flag |
 | A per-session suspicion score gates the LLM, instead of "any regex match escalates" | Weak signals add up across turns, and the expensive LLM only runs once there's enough evidence (score climbed >= 5 since last review) | A novel attack matching no rule scores 0 and is never reviewed; exchanges no rule fired on are "safe" only in the sense of *unreviewed* |
 | Slow review judges the session transcript, not one exchange | Catches a slow build-up of individually minor probes | The transcript is in-memory only (last 6 exchanges); a proxy restart forgets it, though scores persist |
 | NINO (PII) rule is a fast `block` rule — deterministic, no LLM | Compliance rules shouldn't be subject to LLM variance | Intentionally over-flags — a non-NINO string that happens to match the shape still gets blocked |
 | Rubric scores intent, not compliance | A refused attack attempt is still an attack attempt | None — this closed a real gap found in testing |
 | Session identity is a client-generated id, not a cookie | Cookies are one-per-domain; can't run two independent sessions in one browser tab | Backend has zero server-side session state; a session is only as trustworthy as whatever the client sends |
-| No Postgres / virtual-key DB for LiteLLM's built-in admin UI | Kept the whole system to flat local JSON files, no extra infra | LiteLLM's own `/ui` admin dashboard doesn't work (it requires a DB); not needed since our own UI + blocklist file cover the same need here |
+| No Postgres / virtual-key DB for LiteLLM's built-in admin UI | Kept the whole system to one local SQLite file, no extra infra | LiteLLM's own `/ui` admin dashboard doesn't work (it requires a DB); not needed since our own UI + blocklist table cover the same need here |
 | `AIJUDGE_DATA_DIR` is anchored to the repo root via `Path(__file__).resolve()` + the right number of `.parent`s in each of the three Python entry points | They run from different working directories and different folder depths (`litellm_proxy/`, `chatui/backend/`, `judge_ui/`); a naively relative path resolved to *different* folders with no error | Each file must recompute the right `.parent` chain for its own depth — don't copy one file's chain into another without checking it |
 | Judge Dashboard is a fully separate service (own process, port, and codebase), not a route on the chat UI's backend | Explicit ask: it should work as a standalone admin/compliance tool, usable without the chat test UI running at all | Two FastAPI apps instead of one; `judge_rules.py` exists specifically so they don't duplicate (and drift on) what the rules actually are |
 
@@ -223,32 +223,30 @@ Everything the Judge sees and decides lives under `AIJUDGE_DATA_DIR`
 - `data/logs/<uuid>.json` — every request/response pair
 - `data/verdicts/<uuid>.json` — the Judge's verdict for that pair (read by
   the backend's `/api/status` for the "Recent Verdicts" panel)
-- `data/blocked_users.json` — flat JSON array of blocked session ids (written
-  by the Judge and by the dashboard's reset; read by the Judge's pre-call
-  hook, `/api/status`, and `/api/judge-stats`)
+- `data/aijudge.db` — SQLite in WAL mode, opened by all three processes
+  through `judge_store.py` (the only code that knows the schema). Pre-SQLite
+  `blocked_users.json` / `sessions.json` / `stats.json` are imported once and
+  renamed `*.migrated`. Tables:
+  - `blocked` — blocked session ids (written by the Judge and cleared by the
+    dashboard's reset; read by the Judge's pre-call hook, `/api/status`, and
+    `/api/judge-stats`)
+  - `sessions` — per-session suspicion score, review watermark, recent
+    fast-rule hits, last few slow reviews and fast-rule latency. Written by
+    the Judge (debounced; only changed rows); read by `chatui/backend/app.py`
+    and `judge_ui/app.py`
+  - `kv` — the global fast-rule latency block (total/max and the last 200
+    samples), the slow-review threshold, and the running-stats document
+    (request count, verdict breakdown, token usage split chat vs judge,
+    `judge_paths`, unique sessions, rolling request timestamps), which only
+    the Judge writes and only the dashboard reads
 - `data/judge_activity.log` — human-readable trace of every exchange, every
   prompt sent to the LLM judge, its raw response, and the final verdict
   (also mirrored to the LiteLLM proxy's console)
-- `data/sessions.json` — per-session suspicion score, review watermark,
-  recent fast-rule hits, last few slow reviews, and fast-rule latency (per
-  session, plus a global total/max and the last 200 samples for the
-  dashboard's percentiles). Written by the Judge (debounced, atomically via
-  a temp file + rename); read by `chatui/backend/app.py` (per-request
-  latency, session summary) and `judge_ui/app.py`
-- `data/stats.json` — running totals only the Judge writes and only the
-  Judge Dashboard reads: request count, verdict breakdown, token usage
-  (chat traffic and judge-overhead tracked separately), how exchanges were
-  resolved (`judge_paths`: `fast_block` / `fast` / `slow`), unique sessions
-  seen, and a rolling window of request timestamps the dashboard turns
-  into requests/sec
-
-There is no database and no locking — writes are whole-file rewrites of
-small JSON structures. Fine at this scale; wouldn't survive many concurrent
-writers. `stats.json` updates specifically rely on there being no `await`
-between reading and writing it within a single update (see
-`_update_stats` in `judge_logger.py`) — asyncio only switches tasks at an
-`await`, so that's safe today but would need a real lock if that method
-ever grew one.
+SQLite serialises writers, and `update_stats` runs as a read-modify-write
+inside `BEGIN IMMEDIATE`, so stats updates are safe across processes as well
+as asyncio tasks (no more "no `await` between read and write" caveat). Many
+readers never block the writer (WAL). The Judge still keeps the session state
+in memory and flushes it off the request path.
 
 ## 7. Known limitations
 
