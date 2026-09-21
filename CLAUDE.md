@@ -45,6 +45,12 @@ macOS / Linux equivalents live beside them: `scripts/setup.sh`,
 sets in step. `.gitattributes` forces LF on `*.sh`, and the scripts must stay
 executable in git (`git add --chmod=+x`); use `.venv/bin/python` there.
 
+`tests/load_sessions.py` (wrappers `scripts/load-test.sh` / `.ps1`) is a load
+generator, not a test: it fires `--sessions` simulated sessions at the LiteLLM
+proxy, `--bad-pct` of them attackers, and reports detection / false-positive
+rates. It uses real Gemini calls. Its attack list is its own copy of generic
+techniques, separate from `redteam_corpus.py`, so it doesn't import the Judge.
+
 Both run scripts dot-source `scripts/load-env.ps1` to load `.env` into the
 process environment before launching — there is no other env-loading path
 for the LiteLLM proxy, so if you run `litellm` manually, load `.env` first.

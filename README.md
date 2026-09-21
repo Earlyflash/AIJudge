@@ -137,6 +137,27 @@ To see the tiers trigger, in either panel:
 
 The other panel is unaffected, since each has its own session id.
 
+## Load testing (the Judge at volume)
+
+`tests/load_sessions.py` simulates many concurrent chat sessions against the
+running LiteLLM proxy, so you can watch the Judge Dashboard fill up. You choose the
+number of sessions and the percentage that try bad things:
+
+```bash
+scripts/load-test.sh --sessions 100 --bad-pct 30          # macOS / Linux
+.\scripts\load-test.ps1 --sessions 100 --bad-pct 30       # Windows
+```
+
+Each session has its own id and conversation history. "Bad" sessions mix attack
+prompts (injection, secret requests, NI numbers, obfuscated variants, a low-and-slow
+probe) with ordinary turns; benign sessions send ordinary questions only. A blocked
+session stops (`--keep-going` makes it keep sending). At the end it prints request
+rate and latency, the detection rate for bad sessions and the false-positive rate
+for benign ones. Other options: `--min-turns`/`--max-turns`, `--concurrency`,
+`--think`, `--ramp`, `--max-tokens`, `--seed` (repeatable run), `--out results.json`;
+`--help` lists them all. **Every request is a real Gemini call**, so start small and
+mind cost and rate limits (`--concurrency` defaults to 5, replies to 64 tokens).
+
 ## Data
 
 Everything the Judge sees and decides is written under `AIJUDGE_DATA_DIR`
