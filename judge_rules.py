@@ -26,6 +26,10 @@ Keep this free of logging setup, file I/O, network calls, or any other
 side effect: it must be safe to import from either process at any time.
 """
 
+import hashlib
+import os
+import re
+
 # Suspicion points. A minor signal is worth noting; a major one is enough on
 # its own to trigger a slow review.
 POINTS_MINOR = 1
@@ -61,7 +65,23 @@ VALIDATORS = {"luhn": luhn_valid}
 # either letter, and O as the second), six digits, one suffix letter A-D.
 NINO_FORMAT_REGEX = r"\b[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b"
 
-NINO_MENTION = r"(?:national insurance(?: number)?|\bNI\s?number\b|\bNINO\b)"
+def _canary_token() -> str:
+    """The canary planted in the chat backend's system prompt. `AIJUDGE_CANARY`
+    overrides it; otherwise it is derived from LITELLM_MASTER_KEY, which the
+    backend and the Judge already share via .env, so both processes compute
+    the same secret-ish token with no extra file or coordination."""
+    configured = os.environ.get("AIJUDGE_CANARY", "").strip()
+    if configured:
+        return configured
+    seed = os.environ.get("LITELLM_MASTER_KEY", "") or "aijudge-dev"
+    return "cnry-" + hashlib.sha256(f"aijudge-canary:{seed}".encode()).hexdigest()[:16]
+
+
+# Never appears in normal output: if the model repeats it, the system prompt
+# leaked. Exposed as a constant so the backend can plant it.
+CANARY_TOKEN = _canary_token()
+
+NINO_MENTION =r"(?:national insurance(?: number)?|\bNI\s?number\b|\bNINO\b)"
 NINO_VERIFY_INTENT_REGEX = (
     rf"(?:verify|validate|check|confirm|is (?:it|this|that) (?:a )?(?:real|valid)|look\s?up).{{0,60}}{NINO_MENTION}"
     rf"|{NINO_MENTION}.{{0,60}}(?:verify|validate|check|confirm|real|valid|look\s?up)"
@@ -119,6 +139,21 @@ FAST_RULES = [
         "action": "block",
         "points": 0,
         "pattern": r"\b(?:sk|pk|api[_-]?key)[-_][A-Za-z0-9]{16,}\b",
+    },
+    {
+        "id": "canary-leak",
+        "name": "System-prompt canary leaked",
+        "description": (
+            "The canary token planted in the chat backend's system prompt appeared in the "
+            "exchange (also caught after de-obfuscation, e.g. base64). It has no legitimate "
+            "reason to be seen, so this is a near-zero-false-positive system-prompt leak."
+        ),
+        "scope": "both",
+        "action": "block",
+        "points": 0,
+        "pattern": re.escape(CANARY_TOKEN),
+        # The real pattern is the secret itself, so the dashboard shows this instead.
+        "redact_pattern": "(the configured canary token — hidden)",
     },
     {
         "id": "card-number",

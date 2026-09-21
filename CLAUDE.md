@@ -186,6 +186,28 @@ dashboard from what's enforced. `FAST_RULES` must stay JSON-serialisable
 case-insensitive; use an inline `(?-i:...)` group for a case-sensitive token
 (see the `DAN` pattern, which must not match the name "Dan").
 
+`_scan_fast` scans more than the raw text: `_text_variants` also derives
+Unicode-cleaned text (NFKC, combining marks/zero-width/format/control chars
+stripped, Cyrillic/Greek homoglyphs folded), de-spaced letters ("i g n o r e"),
+a leetspeak-folded copy (only when a letter/digit-mixed token is present),
+a rot13 copy, and up to `B64_MAX_CANDIDATES` decoded base64 blobs. A rule
+firing on any variant counts (once per rule). It is pure, in-memory and
+bounded (`VARIANT_MAX_CHARS`), so it stays inside the timed window; it
+costs roughly 2-3x a single regex pass (sub-ms for normal messages). Variants
+are input to regexes only — nothing is logged or stored in decoded form. If
+you add a new decoder, keep it bounded and put a matching case in the corpus.
+
+The `canary-leak` rule (`block`, scope `both`) matches `judge_rules.CANARY_TOKEN`,
+which the chat backend plants in a system message (`SYSTEM_PROMPT` in
+`chatui/backend/app.py`). If the token ever appears in an exchange — even
+base64/rot13/zero-width-split — the session is blocked: a near-zero-false-
+positive system-prompt leak signal. `AIJUDGE_CANARY` overrides it; otherwise
+it is derived from `LITELLM_MASTER_KEY` so the backend and the Judge agree
+with no shared file. The rule's real pattern is the secret, so it carries a
+`redact_pattern` and `judge_ui/app.py` shows that instead. `judge_rules.py`
+now reads env at import (still no I/O); the backend imports it *after*
+`load_dotenv()` for that reason.
+
 The NINO rules (`nino-format`, `nino-verify-intent`) are `block` rules on
 purpose: UK National Insurance Number handling is a compliance requirement,
 not a judgment call, so it never reaches the LLM — deterministic regex only.
