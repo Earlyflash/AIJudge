@@ -39,6 +39,12 @@ Top-level layout:
 .\scripts\run-judge-ui.ps1  # Judge Dashboard: FastAPI backend + static frontend on :8010, --reload enabled
 ```
 
+macOS / Linux equivalents live beside them: `scripts/setup.sh`,
+`run-litellm.sh`, `run-backend.sh`, `run-judge-ui.sh`, plus `run-all.sh`
+(all three in one terminal, Ctrl-C stops them) and `load-env.sh`. Keep the two
+sets in step. `.gitattributes` forces LF on `*.sh`, and the scripts must stay
+executable in git (`git add --chmod=+x`); use `.venv/bin/python` there.
+
 Both run scripts dot-source `scripts/load-env.ps1` to load `.env` into the
 process environment before launching — there is no other env-loading path
 for the LiteLLM proxy, so if you run `litellm` manually, load `.env` first.

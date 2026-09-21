@@ -65,7 +65,11 @@ happened.
 ## Setup
 
 ```powershell
-.\scripts\setup.ps1
+.\scripts\setup.ps1          # Windows
+```
+
+```bash
+scripts/setup.sh                # macOS / Linux (needs Python 3.10+; on a Mac: brew install python@3.12)
 ```
 
 This creates `.venv`, installs `requirements.txt`, and copies `.env.example`
@@ -73,7 +77,22 @@ to `.env`. Edit `.env` and set `GEMINI_API_KEY`.
 
 ## Running
 
-Three processes, in separate terminals:
+Three processes. On macOS / Linux, `scripts/run-all.sh` starts all three in one
+terminal (Ctrl-C stops them; handy for demos):
+
+```bash
+scripts/run-all.sh
+```
+
+Or run them separately, in separate terminals:
+
+```bash
+scripts/run-litellm.sh     # LiteLLM proxy on http://localhost:4000
+scripts/run-backend.sh     # Chat test UI on http://localhost:8000
+scripts/run-judge-ui.sh    # Judge Dashboard on http://localhost:8010
+```
+
+On Windows (PowerShell):
 
 ```powershell
 .\scripts\run-litellm.ps1    # LiteLLM proxy on http://localhost:4000
@@ -164,7 +183,11 @@ blocks, since for PII the safe failure mode is a false positive.
 which are blocked, sent to slow review, or missed:
 
 ```powershell
-.\.venv\Scripts\python.exe tests\redteam_corpus.py
+.\.venv\Scripts\python.exe tests\redteam_corpus.py   # Windows
+```
+
+```bash
+.venv/bin/python tests/redteam_corpus.py             # macOS / Linux
 ```
 
 It needs no running services or API key. It is also a regression gate: each
