@@ -16,6 +16,8 @@ same data to drive its own "Recent Verdicts"/"Blocked Sessions" sidebar.
 
 import json
 import os
+import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -38,8 +40,11 @@ FRONTEND_DIR = APP_DIR / "frontend"
 _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
 DATA_DIR = ((REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")).resolve()
 VERDICTS_DIR = DATA_DIR / "verdicts"
-BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
-SESSIONS_PATH = DATA_DIR / "sessions.json"
+
+sys.path.insert(0, str(REPO_ROOT))
+import judge_store  # noqa: E402 — shared SQLite state written by the Judge
+
+STORE = judge_store.Store(DATA_DIR)
 
 LITELLM_BASE = os.environ.get("AIJUDGE_LITELLM_BASE", "http://localhost:4000")
 LITELLM_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
@@ -50,10 +55,10 @@ app = FastAPI(title="AIJudge")
 
 def _read_sessions():
     """Per-session suspicion score and fast-rule latency, written by the
-    Judge (data/sessions.json). Missing/partial file just means no data."""
+    Judge (sessions table in data/aijudge.db). A read error just means no data."""
     try:
-        return json.loads(SESSIONS_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return STORE.read_sessions_payload()
+    except sqlite3.Error:
         return {}
 
 
@@ -99,7 +104,10 @@ async def chat(req: ChatRequest):
 
     # The Judge's pre-call fast rules ran (and wrote their timing) before the
     # response came back, so this is the latency for *this* request.
-    session = _read_sessions().get("sessions", {}).get(session_id, {})
+    try:
+        session = STORE.get_session(session_id)
+    except sqlite3.Error:
+        session = {}
     fast_check_ms = session.get("last_fast_latency_ms")
 
     if resp.status_code >= 400:
@@ -126,9 +134,10 @@ async def chat(req: ChatRequest):
 
 @app.get("/api/status")
 async def status():
-    blocked_users = []
-    if BLOCKLIST_PATH.exists():
-        blocked_users = json.loads(BLOCKLIST_PATH.read_text())
+    try:
+        blocked_users = STORE.blocked_users()
+    except sqlite3.Error:
+        blocked_users = []
 
     recent_verdicts = []
     if VERDICTS_DIR.exists():

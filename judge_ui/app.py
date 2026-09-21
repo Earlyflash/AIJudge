@@ -1,7 +1,7 @@
 """
 Judge Dashboard: a standalone service, independent of the chat test UI.
 
-Reads data/ directly off disk (stats.json, blocked_users.json, verdicts/)
+Reads data/ directly off disk (the SQLite store, aijudge.db, and verdicts/)
 and the shared judge_rules.py for what the rules actually are — it has no
 dependency on chatui/backend at all, and chatui/backend has none on this.
 An admin/compliance user can run this on its own to see what the Judge is
@@ -10,6 +10,7 @@ doing without needing the chat testing tool running at all.
 
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ FRONTEND_DIR = APP_DIR / "frontend"
 
 sys.path.insert(0, str(REPO_ROOT))
 import judge_rules  # noqa: E402 — shared, side-effect-free rule definitions
+import judge_store  # noqa: E402 — shared SQLite state written by the Judge
 
 # Same anchoring logic as litellm_proxy/judge_logger.py and
 # chatui/backend/app.py — a relative AIJUDGE_DATA_DIR must resolve against
@@ -33,9 +35,8 @@ import judge_rules  # noqa: E402 — shared, side-effect-free rule definitions
 _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
 DATA_DIR = ((REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")).resolve()
 VERDICTS_DIR = DATA_DIR / "verdicts"
-BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
-STATS_PATH = DATA_DIR / "stats.json"
-SESSIONS_PATH = DATA_DIR / "sessions.json"
+
+STORE = judge_store.Store(DATA_DIR)
 
 # Window (seconds) over which requests/sec is computed — must match (or be
 # shorter than) STATS_WINDOW_SECONDS in litellm_proxy/judge_logger.py,
@@ -60,31 +61,21 @@ def _percentile(sorted_values, p):
 
 @app.post("/api/blocklist/reset")
 async def reset_blocklist():
-    cleared = []
-    if BLOCKLIST_PATH.exists():
-        try:
-            cleared = json.loads(BLOCKLIST_PATH.read_text())
-        except json.JSONDecodeError:
-            cleared = []
-    BLOCKLIST_PATH.write_text("[]")
-    # The Judge (a different process) refreshes its in-memory blocklist
-    # from this file's mtime on the next call, so no other coordination
-    # is needed for enforcement to pick this up.
+    cleared = STORE.clear_blocklist()
+    # The Judge (a different process) does an indexed read of the blocked
+    # table on every request, so it sees this on its very next call. Sessions
+    # (scores, watermarks) are untouched.
     return {"cleared_count": len(cleared), "cleared": cleared}
 
 
 @app.get("/api/judge-stats")
 async def judge_stats():
-    blocked_users = []
-    if BLOCKLIST_PATH.exists():
-        blocked_users = json.loads(BLOCKLIST_PATH.read_text())
-
-    stats = {}
-    if STATS_PATH.exists():
-        try:
-            stats = json.loads(STATS_PATH.read_text())
-        except json.JSONDecodeError:
-            stats = {}
+    try:
+        blocked_users = STORE.blocked_users()
+        stats = STORE.read_stats()
+        sessions_file = STORE.read_sessions_payload()
+    except sqlite3.Error:
+        blocked_users, stats, sessions_file = [], {}, {}
 
     recent_timestamps = stats.get("recent_timestamps", [])
     now = time.time()
@@ -106,13 +97,6 @@ async def judge_stats():
         key=lambda s: s.get("chat", 0) + s.get("judge", 0),
         reverse=True,
     )[:8]
-
-    sessions_file = {}
-    if SESSIONS_PATH.exists():
-        try:
-            sessions_file = json.loads(SESSIONS_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            sessions_file = {}
 
     # Latency the fast tier adds to the request path (its pre-call hook).
     fl = sessions_file.get("fast_latency", {})

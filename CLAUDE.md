@@ -22,8 +22,12 @@ Top-level layout:
 - `judge_ui/` (`app.py` + `frontend/`) — the standalone Judge Dashboard
 - `judge_rules.py` (repo root) — rule definitions shared by the Judge and
   the dashboard, so they can never drift apart
+- `judge_store.py` (repo root) — the SQLite storage layer (`data/aijudge.db`)
+  all three processes use for sessions, stats and the blocklist
 - `tests/redteam_corpus.py` — attack/benign prompt corpus scored with the
   fast tier's real code (see Commands)
+- `tests/store_multiprocess.py` — multi-process exercise of `judge_store.py`
+  (exits non-zero on failure)
 - `data/` (gitignored) — the only thing all three processes share
 
 ## Commands
@@ -72,11 +76,11 @@ one-per-domain and can't do that. The backend has no server-side session
 state at all; it just forwards whatever `session_id` it's given to LiteLLM
 as the OpenAI `user` field, which is the identity the Judge blocks.
 `/api/status` returns the global blocklist/verdict lists (not scoped to a
-session), a per-session summary from `data/sessions.json` (suspicion score
+session), a per-session summary from the `sessions` table (suspicion score
 and fast-rule latency, keyed by session id) and the slow-review threshold;
 the frontend checks locally whether each panel's own id appears in
 `blocked_users` and looks up its own entry in `sessions`. `/api/chat` also
-reads `sessions.json` right after LiteLLM responds and echoes the request's
+reads the session row right after LiteLLM responds and echoes the request's
 fast-rule latency as `fast_check_ms` (the pre-call hook wrote it before the
 response came back). The backend still holds no session state of its own.
 
@@ -96,22 +100,22 @@ Its main route, `/api/judge-stats`, returns: `judge_rules.FAST_RULES` (with
 their raw regex sources, for full transparency about what's actually
 enforced) and `judge_rules.SLOW_REVIEW`, `fast_latency` (avg/p50/p95/max of
 what the fast tier adds to the request path), the per-session suspicion
-table, aggregate totals from `data/stats.json`
+table, aggregate totals from the stats document in `data/aijudge.db`
 (requests, verdict counts, token usage split into chat vs. judge-overhead,
 unique session count), a derived `requests_per_second` (see below), the
 current blocklist, and up to 50 recent verdicts.
 
-`POST /api/blocklist/reset` overwrites `blocked_users.json` with `[]` and
-returns what was cleared. It does not touch `sessions.json`: suspicion scores
-and review watermarks are kept, so an unblocked session carries its score. There's no coordination needed with the Judge
-process beyond that write: `_refresh_blocklist` in `judge_logger.py`
-compares the file's mtime on every enforcement check and re-reads it if
-it's changed, so the reset takes effect on that process's very next call
-without a restart. The frontend confirms before calling it (unblocking
+`POST /api/blocklist/reset` empties the `blocked` table (`Store.clear_blocklist`,
+one transaction) and returns what was cleared. It does not touch the
+`sessions` table: suspicion scores and review watermarks are kept, so an
+unblocked session carries its score. There's no coordination needed with the
+Judge process beyond that write: `_is_blocked` in `judge_logger.py` does an
+indexed read of the `blocked` table on every enforcement check, so the reset
+takes effect on that process's very next call without a restart. The frontend confirms before calling it (unblocking
 everyone is a real, if easily-undone-by-testing-again, action) and disables
 the button when the blocklist is already empty.
 
-`requests_per_second` is derived from `stats["recent_timestamps"]`, a
+`requests_per_second` is derived from the stats document's `recent_timestamps`, a
 rolling list of epoch-second floats the Judge appends to on every request
 and trims to `STATS_WINDOW_SECONDS` (300s, in `judge_logger.py`) on every
 write. The dashboard counts how many of those fall within its own
@@ -140,11 +144,13 @@ split: **an LLM call must never add latency to a chat call.**
   response has gone back. The hook times its own work
   (`time.perf_counter`) and stores it per session and globally — keep it
   that way. The timed window (`_fast_precheck`) is in-memory apart from one
-  thing: `_refresh_blocklist` `stat`s the blocklist file on every call (and
-  re-reads it when the mtime changed, e.g. after a dashboard reset), which
-  is deliberately inside the window because it is real request-path cost.
-  All file *writes* (`sessions.json` via the debounced `_schedule_persist`,
-  the blocklist file, exchange records) must stay outside it, otherwise the
+  thing: `_is_blocked` does an indexed SQLite point read of the `blocked`
+  table on every call (so a dashboard reset is seen at once), which is
+  deliberately inside the window because it is real request-path cost. (A
+  session a fast `block` rule has just rejected is also held in
+  `_blocks_in_flight` until the background task commits its block row.)
+  All store/file *writes* (session state via the debounced
+  `_schedule_persist`, the blocked row, exchange records) must stay outside it, otherwise the
   reported "latency added by the fast rules" is a lie. Requests from an
   already-blocked session are rejected in the same hook, record a latency
   sample, but are not logged as exchanges.
@@ -161,9 +167,10 @@ split: **an LLM call must never add latency to a chat call.**
   something to "fix" by sending everything to the LLM.
 
 Per-session state (score, watermark, hits, reviews, latency counters) lives
-in `JudgeLogger._sessions`, mirrored to `data/sessions.json`. All access is
-synchronous on the event loop, so there is no locking; keep it that way (no
-`await` in the middle of a read-modify-write of it). Pre-call results are
+in `JudgeLogger._sessions`, mirrored to the `sessions` table by
+`Store.save_sessions` (only changed rows are upserted). All access to the
+in-memory copy is synchronous on the event loop; keep it that way (no `await`
+in the middle of a read-modify-write of it). Pre-call results are
 handed to the post-call event through `_pending` (per-session FIFO), because
 the pre-call and post-call hooks share no other channel. A request rejected
 in the pre-call hook never gets a matching post-call event
@@ -202,22 +209,25 @@ blocks. For PII, false positives are the safe failure mode.
 - `data/verdicts/<uuid>.json` — the Judge's verdict for that pair, read by
   `chatui/backend/app.py`'s `/api/status` and by `judge_ui/app.py`'s
   `/api/judge-stats`
-- `data/blocked_users.json` — flat JSON array of blocked session ids, written
-  by the Judge (and cleared by the dashboard's reset), read by the Judge's
-  pre-call hook, `/api/status`, and `/api/judge-stats`
+- `data/aijudge.db` — SQLite (WAL mode, stdlib `sqlite3`), opened by all
+  three processes through `judge_store.Store` — the only code that knows the
+  schema. Tables: `blocked` (blocked session ids; written by the Judge,
+  emptied by the dashboard's reset; read by the Judge's pre-call hook,
+  `/api/status` and `/api/judge-stats`), `sessions` (per-session suspicion
+  score, review watermark, recent fast-rule hits, last slow reviews and
+  fast-rule latency, as a JSON row per session; written by the Judge,
+  debounced; read by `chatui/backend/app.py` and `judge_ui/app.py`) and `kv`
+  (JSON documents: `stats`, `fast_latency`, `meta` with the slow-review
+  threshold). Legacy `blocked_users.json` / `sessions.json` / `stats.json`
+  are imported once on first `Store()` open (decided under the write lock, so
+  concurrent starts import once) and renamed `*.migrated`.
 - `data/judge_activity.log` — every exchange, judge prompt, judge raw
   response, and final verdict, via the `aijudge` logger in
   `judge_logger.py` (also mirrored to the LiteLLM proxy's console)
-- `data/sessions.json` — per-session suspicion score, review watermark,
-  recent fast-rule hits, last slow reviews, and fast-rule latency (per
-  session + a global total/max and the last 200 samples). Written by
-  `judge_logger.py` (debounced, temp file + `os.replace`); read by
-  `chatui/backend/app.py` (the per-request `fast_check_ms` echoed to the
-  browser, and a session summary in `/api/status`) and `judge_ui/app.py`
-  (`fast_latency` percentiles and the session suspicion table). Verdict
-  files also carry `fast_latency_ms`, `fast_rules`, `points`,
-  `session_score`.
-- `data/stats.json` — running totals only `judge_logger.py` writes to and
+- Fast-rule latency: the `fast_latency` document (global total/max and the
+  last 200 samples) plus per-session counters. Verdict files also carry
+  `fast_latency_ms`, `fast_rules`, `points`, `session_score`.
+- The `stats` document — running totals only `judge_logger.py` writes and
   only `judge_ui/app.py` reads: `total_requests`, `verdict_counts`, token
   usage (`total_prompt_tokens`/`total_completion_tokens`/`total_tokens`,
   plus `judge_overhead_tokens` from the LLM-judge's own calls, tracked
@@ -229,10 +239,9 @@ blocks. For PII, false positives are the safe failure mode.
   `fast` / `slow` — only `slow` costs tokens), `token_buckets` (per-minute
   chat vs judge totals, last 60 minutes, drives the dashboard timeline) and
   `session_tokens` (per-session chat/judge totals). Verdict files also carry
-  `chat_tokens`, `judge_tokens` and `judge_path`. All updates go
-  through `_update_stats`'s read-modify-write-whole-file pattern — safe
-  under asyncio because there's no `await` between the read and the write
-  in any caller, so no other task can interleave.
+  `chat_tokens`, `judge_tokens` and `judge_path`. All updates go through
+  `_update_stats` -> `Store.update_stats`, a read-modify-write inside
+  `BEGIN IMMEDIATE`, so it is atomic across processes and tasks alike.
 
 `judge_logger.py`, `chatui/backend/app.py`, and `judge_ui/app.py` each
 anchor a relative `AIJUDGE_DATA_DIR` to the repo root explicitly, computed
@@ -248,11 +257,12 @@ directly in `judge_ui/` with no `backend/` subfolder). Concretely:
 restructure any of these three, recompute this per file — don't copy the
 `.parent` chain from one to another without checking its actual depth.
 
-All three processes read `blocked_users.json`, `sessions.json` and
-`data/verdicts/` independently — they're different Python processes, so `data/` is the only
-shared state between them. There is no locking; writes are whole-file
-rewrites of small JSON structures, which is fine at this scale but
-wouldn't survive concurrent writers at higher volume.
+All three processes open `data/aijudge.db` and read `data/verdicts/`
+independently — they're different Python processes, so `data/` is the only
+shared state between them. SQLite (WAL) provides the locking: readers never
+block the Judge's writes. `judge_store.Store` uses one connection per process
+guarded by a lock (`check_same_thread=False`) and keeps writes in explicit
+transactions. Exercise it with `python tests/store_multiprocess.py`.
 
 ### Model name plumbing
 

@@ -7,11 +7,10 @@ different timelines on purpose (rule definitions live in judge_rules.py):
 FAST — deterministic rules, no AI.
   * Input rules run in async_pre_call_hook, i.e. in the request path, so a
     "block" rule stops the *current* request. That is pure regex (plus a
-    Luhn check) over the latest user message and a blocklist check (a stat
-    of the blocklist file plus a set lookup), and the time it takes is
-    measured on every call and stored per session (data/sessions.json) so the
-    latency cost of this decision is visible on both UIs. File writes are
-    kept out of the measured window.
+    Luhn check) over the latest user message and a blocklist check (one
+    indexed SQLite read), and the time it takes is measured on every call and
+    stored per session (data/aijudge.db) so the latency cost of this decision
+    is visible on both UIs. Store writes are kept out of the measured window.
   * Output rules run after the response has been returned.
   * A "score" rule adds points to the session's suspicion score instead.
 
@@ -26,6 +25,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 import uuid
@@ -44,16 +44,14 @@ from litellm.integrations.custom_logger import CustomLogger
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import judge_rules  # noqa: E402 — shared, side-effect-free rule definitions
+import judge_store  # noqa: E402 — shared SQLite state (sessions, stats, blocklist)
 
 _data_dir_env = os.environ.get("AIJUDGE_DATA_DIR")
 DATA_DIR = (REPO_ROOT / _data_dir_env) if _data_dir_env else (REPO_ROOT / "data")
 DATA_DIR = DATA_DIR.resolve()
 LOGS_DIR = DATA_DIR / "logs"
 VERDICTS_DIR = DATA_DIR / "verdicts"
-BLOCKLIST_PATH = DATA_DIR / "blocked_users.json"
 JUDGE_LOG_FILE = DATA_DIR / "judge_activity.log"
-STATS_PATH = DATA_DIR / "stats.json"
-SESSIONS_PATH = DATA_DIR / "sessions.json"
 
 # How long a request timestamp stays in stats["recent_timestamps"], used to
 # derive a live requests/sec figure on the Judge Dashboard. Trimmed on every
@@ -66,7 +64,7 @@ STATS_WINDOW_SECONDS = 300
 TOKEN_BUCKET_SECONDS = 60
 TOKEN_BUCKET_KEEP = 60
 
-# Per-session state (data/sessions.json): how many recent fast-rule hits and
+# Per-session state (sessions table in data/aijudge.db): how many recent fast-rule hits and
 # slow reviews to keep, and how many recent fast-check latencies (globally)
 # to keep for the dashboard's percentile figures.
 MAX_HITS_KEPT = 20
@@ -78,31 +76,8 @@ LATENCY_SAMPLES_KEPT = 200
 TRANSCRIPT_EXCHANGES = 6
 TRANSCRIPT_CHARS = 1500
 
-# sessions.json writes are coalesced so a burst of requests costs one write.
+# Session-state writes are coalesced so a burst of requests costs one write.
 PERSIST_DEBOUNCE_SECONDS = 0.05
-
-
-def _default_stats():
-    return {
-        "total_requests": 0,
-        "verdict_counts": {"safe": 0, "suspicious": 0, "bad": 0},
-        "total_prompt_tokens": 0,
-        "total_completion_tokens": 0,
-        "total_tokens": 0,
-        "judge_overhead_tokens": 0,
-        "judge_prompt_tokens": 0,
-        "judge_completion_tokens": 0,
-        "judge_calls": 0,
-        # How each exchange was resolved: blocked by a fast rule, fast rules
-        # only (scored or clean — no AI), or triggered a slow LLM review.
-        "judge_paths": {"fast_block": 0, "fast": 0, "slow": 0},
-        # epoch-minute (str) -> {"chat": tokens, "judge": tokens}
-        "token_buckets": {},
-        # session id -> {"chat": tokens, "judge": tokens, "requests": n}
-        "session_tokens": {},
-        "unique_sessions": [],
-        "recent_timestamps": [],
-    }
 
 
 def _new_session():
@@ -120,24 +95,12 @@ def _new_session():
     }
 
 
-def _default_fast_latency():
-    return {"checks": 0, "total_ms": 0.0, "max_ms": 0.0, "recent": []}
-
-
-def _load_sessions_file():
-    try:
-        raw = json.loads(SESSIONS_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        raw = {}
-    return raw.get("sessions", {}), {**_default_fast_latency(), **raw.get("fast_latency", {})}
-
-
 for d in (LOGS_DIR, VERDICTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
-if not BLOCKLIST_PATH.exists():
-    BLOCKLIST_PATH.write_text("[]")
-if not STATS_PATH.exists():
-    STATS_PATH.write_text(json.dumps(_default_stats(), indent=2))
+
+# One connection for this process (WAL: the chat backend and the dashboard
+# read the same file concurrently). Imports any pre-SQLite JSON state once.
+STORE = judge_store.Store(DATA_DIR)
 
 # Every exchange the Judge sees, every prompt it sends to the LLM judge, and
 # every verdict it reaches goes to both the proxy's console and this file.
@@ -221,12 +184,10 @@ SESSION TRANSCRIPT (oldest first):
 class JudgeLogger(CustomLogger):
     def __init__(self):
         super().__init__()
-        self._blocklist_cache = set(json.loads(BLOCKLIST_PATH.read_text()))
-        self._blocklist_mtime = BLOCKLIST_PATH.stat().st_mtime
-        # Session state is held in memory and mirrored to sessions.json (for
-        # the other processes) off the request path. Everything that touches
+        # Session state is held in memory and mirrored to the SQLite store
+        # (for the other processes) off the request path. Everything that touches
         # it is synchronous on the event loop, so no locking is needed.
-        self._sessions, self._fast_latency = _load_sessions_file()
+        self._sessions, self._fast_latency = STORE.load_sessions()
         self._persist_handle = None
         # session id -> in-flight pre-call results (FIFO) awaiting the
         # matching post-call event; bounded so a request that never reaches
@@ -237,13 +198,17 @@ class JudgeLogger(CustomLogger):
         # back to whatever exchanges have happened since.
         self._transcripts = defaultdict(lambda: deque(maxlen=TRANSCRIPT_EXCHANGES))
         self._reviewing = set()
+        # Sessions a fast `block` rule has just rejected whose block row the
+        # background task hasn't written yet (see _fast_precheck/_block_user).
+        self._blocks_in_flight = set()
 
-    def _refresh_blocklist(self):
-        mtime = BLOCKLIST_PATH.stat().st_mtime
-        if mtime != self._blocklist_mtime:
-            self._blocklist_cache = set(json.loads(BLOCKLIST_PATH.read_text()))
-            self._blocklist_mtime = mtime
-        return self._blocklist_cache
+    def _is_blocked(self, user_id):
+        # An indexed point read on every call, so a dashboard reset (another
+        # process) is honoured immediately. Deliberately inside the timed fast
+        # window: it is real request-path cost. _blocks_in_flight covers the
+        # gap between a fast rule rejecting a request and the background task
+        # committing the block.
+        return user_id in self._blocks_in_flight or STORE.is_blocked(user_id)
 
     # --- Session state ---
 
@@ -292,21 +257,10 @@ class JudgeLogger(CustomLogger):
         if self._persist_handle is not None:
             self._persist_handle.cancel()
             self._persist_handle = None
-        payload = json.dumps({
-            "slow_review_threshold": judge_rules.SLOW_REVIEW_THRESHOLD,
-            "updated_at": time.time(),
-            "sessions": self._sessions,
-            "fast_latency": self._fast_latency,
-        })
-        tmp = SESSIONS_PATH.with_suffix(".json.tmp")
         try:
-            tmp.write_text(payload)
-            os.replace(tmp, SESSIONS_PATH)  # readers never see a half-written file
-        except OSError:
-            try:
-                SESSIONS_PATH.write_text(payload)
-            except OSError as e:
-                logger.warning("could not write sessions.json: %s", e)
+            STORE.save_sessions(self._sessions, self._fast_latency, judge_rules.SLOW_REVIEW_THRESHOLD)
+        except sqlite3.Error as e:
+            logger.warning("could not persist session state: %s", e)
 
     # --- FAST tier, request path ---
 
@@ -329,10 +283,10 @@ class JudgeLogger(CustomLogger):
 
     def _fast_precheck(self, user_id, data):
         """Everything the fast tier does in the request path. No file writes
-        (so the timing around it is honest); the only file access is
-        _refresh_blocklist's mtime stat, which is real request-path cost."""
+        (so the timing around it is honest); the only store access is
+        _is_blocked's indexed read, which is real request-path cost."""
         session_id = user_id or "unknown"
-        if user_id and user_id in self._refresh_blocklist():
+        if user_id and self._is_blocked(user_id):
             return {"reject": f"Blocked by AIJudge: '{user_id}' was flagged for suspicious/bad activity.",
                     "kind": "blocklist"}
 
@@ -342,7 +296,7 @@ class JudgeLogger(CustomLogger):
         blockers = [r for r in hits if r["action"] == "block"]
         if blockers:
             if user_id:
-                self._blocklist_cache.add(user_id)  # file write happens in the background task
+                self._blocks_in_flight.add(user_id)  # the store write happens in the background task
             names = ", ".join(r["name"] for r in blockers)
             return {"reject": f"Blocked by AIJudge: '{user_id}' tripped a fast rule ({names}).",
                     "kind": "rule", "hits": hits, "points": points, "blockers": blockers, "text": text}
@@ -547,15 +501,9 @@ class JudgeLogger(CustomLogger):
 
     @staticmethod
     def _update_stats(mutate):
-        """Read-modify-write data/stats.json. Safe under asyncio's cooperative
-        scheduling as long as callers do this with no `await` in between the
-        read and the write — see module docstring."""
-        try:
-            stats = json.loads(STATS_PATH.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            stats = _default_stats()
-        mutate(stats)
-        STATS_PATH.write_text(json.dumps(stats, indent=2))
+        """Read-modify-write the stats document, atomically in the store
+        (BEGIN IMMEDIATE), so it is safe across processes as well as tasks."""
+        STORE.update_stats(mutate)
 
     def _record_request_stats(self, user_id, verdict, usage, judge_usage, judge_path):
         def mutate(stats):
@@ -721,11 +669,8 @@ class JudgeLogger(CustomLogger):
         return verdict, usage
 
     def _block_user(self, user_id):
-        blocklist = self._refresh_blocklist()
-        blocklist.add(user_id)
-        BLOCKLIST_PATH.write_text(json.dumps(sorted(blocklist), indent=2))
-        self._blocklist_cache = blocklist
-        self._blocklist_mtime = BLOCKLIST_PATH.stat().st_mtime
+        STORE.block(user_id)
+        self._blocks_in_flight.discard(user_id)
         logger.warning("BLOCKED user '%s' for suspicious/bad activity.", user_id)
 
 
