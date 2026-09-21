@@ -80,8 +80,8 @@ intentional, not an omission (see §5).
 | LiteLLM proxy | `litellm_proxy/config.yaml` | Declares the `gemini-flash` model and registers the Judge callback. |
 | Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback: the fast tier in the pre-call hook (plus output rules post-call) and the slow LLM review post-call (see §3); writes the SQLite store (`data/aijudge.db`: sessions, stats, blocklist), logs and verdicts. |
 | Shared rules | `judge_rules.py` (repo root) | Side-effect-free fast rules (regex + validators, actions and weights), the slow-review threshold and description — the single source of truth for what's actually enforced, read by both the Judge and the dashboard. |
-| Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view (plus the blocklist reset): fast and slow rules, fast-rule latency, per-session suspicion scores, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
-| Red-team corpus | `tests/redteam_corpus.py` | Scores attack and benign prompts with the real fast-tier code and reports catches vs misses; a measuring tool, not a pass/fail suite. |
+| Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view (plus the blocklist reset): fast and slow rules, fast-rule latency, per-session suspicion scores with a per-session drill-down (`/api/sessions/{id}`: exchanges, rule hits, judge prompts and replies), shadow-rule hit counts, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
+| Red-team corpus | `tests/redteam_corpus.py`, `.github/workflows/redteam.yml` | Scores attack and benign prompts with the real fast-tier code against a per-case expectation; exits non-zero on a regression, and CI runs it. |
 | Data store | `data/` (gitignored) | The only shared state across all three Python processes — one shared SQLite database (`aijudge.db`, WAL) via `judge_store.py`, plus per-exchange log/verdict files and a log file. |
 
 ## 3. The core design decision: a fast tier and a slow tier
@@ -179,6 +179,15 @@ as `judge_path` on the verdict and counted in the stats document:
    checks first thing and returns early on — this is what stops the Judge
    from recursively logging and judging its own judgment calls.
 
+Fast-tier detail worth knowing: `_scan_fast` scans the raw text plus cheap in-memory
+variants (`_text_variants`: Unicode-cleaned and homoglyph-folded text, de-spaced letters,
+a leetspeak fold, rot13, and a bounded number of base64-decoded blobs) so trivial
+obfuscation does not defeat the regexes; this is bounded and does no I/O, so it stays
+inside the timed window. Rules flagged `shadow` are matched and recorded but never
+block or score, which lets a new rule be trialled on real traffic first. The
+`canary-leak` rule blocks any exchange containing the token planted in the chat
+backend's system prompt.
+
 The rubric explicitly judges **user intent, not assistant compliance**: a
 prompt-injection attempt that the model successfully refuses is still
 scored "bad", not "suspicious". This was a real bug found during testing —
@@ -265,5 +274,10 @@ in memory and flushes it off the request path.
   affect the session's later turns.
 - The fast tier is regex, so it is beatable by rewording, obfuscation
   (leetspeak, homoglyphs, encodings), other languages and fictional framing.
-  Run `tests/redteam_corpus.py` to see, for the current rules, which
+  Input normalisation covers common encodings, but not other languages,
+  fictional framing or low-and-slow multi-turn probing. Run
+  `tests/redteam_corpus.py` to see, for the current rules, which
   public-technique prompts are caught and which slip through.
+- The dashboard's session drill-down reads the judge's prompt and reply from the tail
+  of `judge_activity.log` and scans verdict files per request; fine here, but it would
+  need an index by session at volume.
