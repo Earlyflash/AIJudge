@@ -40,12 +40,20 @@ process environment before launching — there is no other env-loading path
 for the LiteLLM proxy, so if you run `litellm` manually, load `.env` first.
 
 `.env` (copied from `.env.example`, gitignored) must have `GEMINI_API_KEY`
-set for either process to actually reach Gemini. There is no automated test
-suite. `tests/redteam_corpus.py` is a runner, not assertions: from the repo
-root, `.venv\Scripts\python.exe tests\redteam_corpus.py` scores a corpus of
+set for either process to actually reach Gemini. There is no unit-test suite;
+the regression gate is `tests/redteam_corpus.py`. From the repo root,
+`.venv\Scripts\python.exe tests\redteam_corpus.py` scores a corpus of
 public-technique attack prompts (and benign look-alikes) with the real
-`judge_logger._scan_fast`, and prints which are blocked / sent to slow review
-/ missed by the fast tier. Re-run it after changing `FAST_RULES`.
+`judge_logger._scan_fast`, prints which are blocked / sent to slow review /
+missed by the fast tier, and **exits 1 if any case misses its expectation**.
+Each case carries one: `block`, `review` (must be caught), `miss-allowed`
+(known gap), `benign-pass` (must not trigger review), `fp-allowed` (known
+false positive). The expectations pin current behaviour, so when a rule change
+legitimately moves a case, update its expectation in the same commit; the
+runner prints a `note:` when a known gap is now caught or a known false
+positive has gone, as a prompt to tighten it. Run it after changing
+`FAST_RULES`. CI (`.github/workflows/redteam.yml`) runs it on every push and PR;
+it needs no API key.
 
 ## Architecture
 

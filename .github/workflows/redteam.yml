@@ -1,0 +1,22 @@
+name: redteam-corpus
+
+# Regression gate for the Judge's fast tier: scores tests/redteam_corpus.py with
+# the real judge_logger._scan_fast and fails on any case that misses its
+# expectation. Needs no API key — the fast tier is deterministic regex.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  redteam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python tests/redteam_corpus.py
