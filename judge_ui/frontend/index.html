@@ -56,6 +56,7 @@
     <section class="panel">
       <h2>Session Suspicion</h2>
       <p class="hint" id="sessions-hint"></p>
+      <p class="hint">Click a session to see every exchange, its rule hits and the judge's verdicts.</p>
       <div class="table-scroll">
         <table class="sessions-table" id="sessions-table">
           <thead>
@@ -64,6 +65,17 @@
           <tbody id="sessions-body"><tr><td colspan="6" class="empty">No sessions yet</td></tr></tbody>
         </table>
       </div>
+    </section>
+
+    <section class="panel" id="session-detail" hidden>
+      <div class="detail-head">
+        <h2>Session detail</h2>
+        <div>
+          <button type="button" id="detail-refresh">Refresh</button>
+          <button type="button" id="detail-close">Close</button>
+        </div>
+      </div>
+      <div id="detail-body"></div>
     </section>
 
     <div class="two-col">

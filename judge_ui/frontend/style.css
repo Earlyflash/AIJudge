@@ -331,3 +331,26 @@ h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 .action-chip.shadow { background: rgba(120, 130, 150, 0.18); color: var(--muted, #8a93a6); border: 1px dashed currentColor; }
 .raw-block h3 { margin: 0.6rem 0 0.2rem; font-size: 0.8rem; }
 .raw-block code { display: block; word-break: break-all; }
+
+/* --- Session drill-down --- */
+.sessions-table tr.clickable { cursor: pointer; }
+.sessions-table tr.clickable:hover, .sessions-table tr.selected { background: #1e222b; }
+.detail-head { display: flex; justify-content: space-between; align-items: center; }
+.detail-head button {
+  background: transparent; color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.25rem 0.7rem; cursor: pointer; margin-left: 0.4rem;
+}
+.detail-head button:hover { border-color: var(--accent); }
+.exchange { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; margin: 0.6rem 0; }
+.exchange-head { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; font-size: 0.85rem; }
+.exchange-reason { color: var(--muted); font-size: 0.85rem; margin: 0.3rem 0; }
+.exchange h4 { margin: 0.5rem 0 0.2rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.exchange pre {
+  margin: 0; padding: 0.5rem; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; white-space: pre-wrap; word-break: break-word; max-height: 16rem; overflow: auto; font-size: 0.82rem;
+}
+.exchange details { margin-top: 0.4rem; }
+.exchange summary { cursor: pointer; color: var(--accent); font-size: 0.82rem; }
+.review-list { padding-left: 1.1rem; }
+.tag.shadow { background: transparent; color: var(--muted); border: 1px dashed var(--muted); }
+#session-detail[hidden] { display: none; }

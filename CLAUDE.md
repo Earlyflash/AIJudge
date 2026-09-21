@@ -113,6 +113,16 @@ table, aggregate totals from the stats document in `data/aijudge.db`
 unique session count), a derived `requests_per_second` (see below), the
 current blocklist, and up to 50 recent verdicts.
 
+`GET /api/sessions/{session_id}` powers the dashboard's session drill-down
+(click a row in the suspicion table): the session's state and slow reviews from
+the store, every verdict file whose `user_id` matches (input, output, fast/shadow
+rules, points, verdict, score after each exchange), and, for `slow`-path
+exchanges, the judge's prompt and raw reply, parsed out of the tail of
+`judge_activity.log` (the only place they are kept; `ACTIVITY_LOG_TAIL_BYTES`).
+It scans up to `SESSION_SCAN_MAX_FILES` newest verdict files, which is fine at
+prototype scale (an index by session would be the next step). The canary token
+is redacted from everything it returns.
+
 `POST /api/blocklist/reset` empties the `blocked` table (`Store.clear_blocklist`,
 one transaction) and returns what was cleared. It does not touch the
 `sessions` table: suspicion scores and review watermarks are kept, so an

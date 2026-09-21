@@ -10,13 +10,14 @@ doing without needing the chat testing tool running at all.
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
@@ -50,6 +51,14 @@ TIMELINE_MINUTES = 30
 # How many sessions the suspicion table lists.
 TOP_SESSIONS_SHOWN = 20
 
+# Drill-down limits: how many verdict files to scan for one session, and how
+# much of the tail of judge_activity.log to search for judge prompts/replies.
+SESSION_SCAN_MAX_FILES = 3000
+ACTIVITY_LOG_TAIL_BYTES = 4_000_000
+_LOG_ENTRY_START = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[AIJudge\] ", re.M)
+_JUDGE_PROMPT = re.compile(r"^REQUEST (\S+) \| JUDGE PROMPT[^\n]*\n(.*)\Z", re.S)
+_JUDGE_RAW = re.compile(r"^REQUEST (\S+) \| JUDGE RAW RESPONSE: (.*)\Z", re.S)
+
 app = FastAPI(title="AIJudge — Judge Dashboard")
 
 
@@ -66,6 +75,91 @@ async def reset_blocklist():
     # table on every request, so it sees this on its very next call. Sessions
     # (scores, watermarks) are untouched.
     return {"cleared_count": len(cleared), "cleared": cleared}
+
+
+def _judge_transcripts(record_ids):
+    """Judge prompt / raw replies per triggering record id, from the tail of
+    judge_activity.log (the only place they are kept)."""
+    wanted = set(record_ids)
+    found = {}
+    log_file = DATA_DIR / "judge_activity.log"
+    if not wanted or not log_file.exists():
+        return found
+    with open(log_file, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - ACTIVITY_LOG_TAIL_BYTES))
+        text = fh.read().decode("utf-8", errors="replace")
+    for entry in _LOG_ENTRY_START.split(text):
+        entry = entry.rstrip("\n")
+        m = _JUDGE_PROMPT.match(entry)
+        if m and m.group(1) in wanted:
+            found.setdefault(m.group(1), {"prompt": None, "raw": []})["prompt"] = m.group(2)
+            continue
+        m = _JUDGE_RAW.match(entry)
+        if m and m.group(1) in wanted:
+            found.setdefault(m.group(1), {"prompt": None, "raw": []})["raw"].append(m.group(2))
+    return found
+
+
+def _redact(text):
+    # The canary is a secret; the chat backend's system prompt carries it, so
+    # it appears in logged inputs. Never show it in the dashboard.
+    return text.replace(judge_rules.CANARY_TOKEN, "[canary]") if isinstance(text, str) else text
+
+
+def _last_user_text(input_text):
+    """The final user message of a logged input ("role: content" lines)."""
+    marker = "\nuser: "
+    i = input_text.rfind(marker)
+    if i >= 0:
+        return input_text[i + len(marker):]
+    return input_text[len("user: "):] if input_text.startswith("user: ") else input_text
+
+
+@app.get("/api/sessions/{session_id}")
+async def session_detail(session_id: str):
+    """Everything the Judge recorded for one session: its state, every
+    exchange (input, output, fast-rule hits, verdict) and the slow-tier
+    judge's prompt / raw reply where a review ran."""
+    try:
+        session = STORE.read_sessions_payload().get("sessions", {}).get(session_id)
+        blocked = session_id in STORE.blocked_users()
+    except sqlite3.Error:
+        session, blocked = None, False
+
+    exchanges = []
+    if VERDICTS_DIR.exists():
+        files = sorted(VERDICTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files[:SESSION_SCAN_MAX_FILES]:
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if rec.get("user_id") == session_id:
+                exchanges.append(rec)
+    exchanges.sort(key=lambda r: r.get("timestamp", ""))
+
+    judge = _judge_transcripts([e["id"] for e in exchanges if e.get("judge_path") == "slow"])
+    for e in exchanges:
+        e["user_text"] = _redact(_last_user_text(e.get("input", "")))
+        e["input"] = _redact(e.get("input", ""))
+        e["output"] = _redact(e.get("output", ""))
+        e["judge"] = judge.get(e["id"])
+
+    if session is None and not exchanges:
+        raise HTTPException(status_code=404, detail="unknown session")
+    session = session or {}
+    return {
+        "session_id": session_id,
+        "blocked": blocked,
+        "score": session.get("score", 0),
+        "reviewed_score": session.get("reviewed_score", 0),
+        "requests": session.get("requests", 0),
+        "reviews": session.get("reviews", []),
+        "hits": session.get("hits", []),
+        "slow_review_threshold": judge_rules.SLOW_REVIEW_THRESHOLD,
+        "exchanges": exchanges,
+    }
 
 
 @app.get("/api/judge-stats")

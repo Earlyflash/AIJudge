@@ -25,6 +25,10 @@ const tokenSessionsEl = document.getElementById("token-sessions");
 let rulesRendered = false;
 let shadowKey = "";
 let lastBlockedCount = 0;
+let openSessionId = null;
+
+const detailEl = document.getElementById("session-detail");
+const detailBodyEl = document.getElementById("detail-body");
 
 function fmtNumber(n) {
   return new Intl.NumberFormat().format(n || 0);
@@ -90,7 +94,7 @@ function renderSessions(data) {
         ? `<span class="tag ${["safe", "suspicious", "bad"].includes(r.verdict) ? r.verdict : "suspicious"}">${esc(r.verdict)}</span> <span class="muted" title="${esc(r.reason)}">at score ${r.score_at_review}</span>`
         : '<span class="muted">&mdash;</span>';
       return `
-        <tr>
+        <tr class="clickable${s.session_id === openSessionId ? " selected" : ""}" data-sid="${esc(s.session_id)}">
           <td title="${esc(s.session_id)}"><code>${esc(s.session_id.slice(0, 8))}</code></td>
           <td>
             <div class="score-cell"><div class="score-track"><div class="score-fill${pending >= threshold ? " hot" : ""}" style="width:${pct}%"></div></div>
@@ -409,3 +413,78 @@ async function pollStats() {
 
 pollStats();
 setInterval(pollStats, 3000);
+
+
+// --- Session drill-down ---
+
+const fmtTime = (iso) => (iso ? new Date(iso).toLocaleTimeString() : "");
+const verdictClass = (v) => (["safe", "suspicious", "bad"].includes(v) ? v : "suspicious");
+
+function renderExchange(e) {
+  const rules = (e.fast_rules || []).map((r) => `<span class="tag suspicious">${esc(r)}</span>`).join(" ");
+  const shadow = (e.shadow_rules || []).map((r) => `<span class="tag shadow">${esc(r)} (shadow)</span>`).join(" ");
+  const judge = e.judge
+    ? `<details><summary>Judge prompt and raw response</summary>
+         <h4>Prompt</h4><pre>${esc(e.judge.prompt || "(not found in judge_activity.log)")}</pre>
+         <h4>Raw response</h4><pre>${esc((e.judge.raw || []).join("\n---\n") || "(not found)")}</pre>
+       </details>`
+    : "";
+  return `
+    <div class="exchange">
+      <div class="exchange-head">
+        <span class="muted">${esc(fmtTime(e.timestamp))}</span>
+        <span class="tag ${verdictClass(e.verdict)}">${esc(e.verdict)}</span>
+        <span class="muted">path: ${esc(e.judge_path || "?")}</span>
+        <span class="muted">+${e.points || 0} pts &rarr; score ${e.session_score ?? "?"}</span>
+        ${rules} ${shadow}
+      </div>
+      <div class="exchange-reason">${esc(e.reason || "")}</div>
+      <h4>User</h4><pre>${esc(e.user_text || "")}</pre>
+      <h4>Assistant</h4><pre>${esc(e.output || "")}</pre>
+      <details><summary>Full input sent to the model</summary><pre>${esc(e.input || "")}</pre></details>
+      ${judge}
+    </div>`;
+}
+
+function renderSessionDetail(d) {
+  const threshold = d.slow_review_threshold;
+  const reviews = (d.reviews || [])
+    .map((r) => `<li><span class="tag ${verdictClass(r.verdict)}">${esc(r.verdict)}</span>
+      <span class="muted">at score ${r.score_at_review} &middot; ${esc(new Date(r.ts * 1000).toLocaleTimeString())}</span>
+      &mdash; ${esc(r.reason || "")}</li>`)
+    .join("");
+  const trail = d.exchanges.map((e) => e.session_score ?? 0);
+  detailBodyEl.innerHTML = `
+    <p><code>${esc(d.session_id)}</code>
+      ${d.blocked ? '<span class="tag bad">blocked</span>' : '<span class="tag safe">not blocked</span>'}
+      <span class="muted">score ${d.score} (reviewed to ${d.reviewed_score}, review at +${threshold}) &middot; ${d.requests} requests</span></p>
+    ${trail.length ? `<p class="muted">Score after each exchange: ${trail.join(" &rarr; ")}</p>` : ""}
+    <h3>Slow-tier reviews</h3>
+    ${reviews ? `<ul class="review-list">${reviews}</ul>` : '<p class="muted">No LLM review has run for this session.</p>'}
+    <h3>Exchanges (${d.exchanges.length}, oldest first)</h3>
+    ${d.exchanges.map(renderExchange).join("") || '<p class="muted">No logged exchanges (verdict files) for this session.</p>'}`;
+}
+
+async function openSession(sid) {
+  openSessionId = sid;
+  detailEl.hidden = false;
+  detailBodyEl.innerHTML = '<p class="muted">Loading&hellip;</p>';
+  try {
+    const res = await fetch("/api/sessions/" + encodeURIComponent(sid));
+    if (!res.ok) throw new Error(res.status === 404 ? "No data for this session." : "HTTP " + res.status);
+    renderSessionDetail(await res.json());
+  } catch (err) {
+    detailBodyEl.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+  }
+  detailEl.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+sessionsBodyEl.addEventListener("click", (ev) => {
+  const row = ev.target.closest("tr[data-sid]");
+  if (row) openSession(row.dataset.sid);
+});
+document.getElementById("detail-refresh").addEventListener("click", () => openSessionId && openSession(openSessionId));
+document.getElementById("detail-close").addEventListener("click", () => {
+  openSessionId = null;
+  detailEl.hidden = true;
+});
