@@ -328,5 +328,6 @@ h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 .action-chip { display: inline-block; font-family: ui-monospace, Consolas, monospace; font-size: 0.7rem; padding: 0 0.35rem; border-radius: 4px; margin-right: 0.3rem; }
 .action-chip.block { background: rgba(224, 71, 63, 0.15); color: var(--bad); }
 .action-chip.score { background: rgba(224, 167, 47, 0.15); color: var(--suspicious); }
+.action-chip.shadow { background: rgba(120, 130, 150, 0.18); color: var(--muted, #8a93a6); border: 1px dashed currentColor; }
 .raw-block h3 { margin: 0.6rem 0 0.2rem; font-size: 0.8rem; }
 .raw-block code { display: block; word-break: break-all; }

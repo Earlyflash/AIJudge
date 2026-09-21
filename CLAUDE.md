@@ -216,6 +216,17 @@ with no shared file. The rule's real pattern is the secret, so it carries a
 now reads env at import (still no I/O); the backend imports it *after*
 `load_dotenv()` for that reason.
 
+Any rule can carry `"shadow": True` to trial it on real traffic: it is
+matched and recorded but never blocks and adds no points. `_apply_hits`
+zeroes its points and tags the session hit `shadow`; the blocker lists in
+`_fast_precheck`/`_handle_event` skip it; verdict files list it under
+`shadow_rules` (separate from `fast_rules`); `_log_shadow_hits` writes it to
+`judge_activity.log` — deliberately post-call/background, never inside the
+timed fast window. `/api/judge-stats` returns `shadow_hits` (per-rule counts
+over the hits sessions still retain, `MAX_HITS_KEPT` each, so recent rather
+than lifetime) and the dashboard marks shadow rules in the rules list.
+`tests/redteam_corpus.py` ignores shadow rules, i.e. it scores what is enforced.
+
 The NINO rules (`nino-format`, `nino-verify-intent`) are `block` rules on
 purpose: UK National Insurance Number handling is a compliance requirement,
 not a judgment call, so it never reaches the LLM — deterministic regex only.

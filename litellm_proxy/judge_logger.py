@@ -347,16 +347,28 @@ class JudgeLogger(CustomLogger):
         now = time.time()
         points = 0
         for rule in hits:
-            added = rule["points"] if rule["action"] == "score" else 0
+            shadow = bool(rule.get("shadow"))
+            added = rule["points"] if rule["action"] == "score" and not shadow else 0
             points += added
-            session["hits"].append(
-                {"rule": rule["id"], "name": rule["name"], "scope": scope,
-                 "action": rule["action"], "points": added, "ts": now}
-            )
+            hit = {"rule": rule["id"], "name": rule["name"], "scope": scope,
+                   "action": rule["action"], "points": added, "ts": now}
+            if shadow:
+                hit["shadow"] = True
+            session["hits"].append(hit)
         session["hits"] = session["hits"][-MAX_HITS_KEPT:]
         session["score"] += points
         session["last_seen"] = now
         return points
+
+    @staticmethod
+    def _log_shadow_hits(record_id, user_id, hits):
+        """Shadow rules never block or score; they are only recorded. Logged
+        here (post-call / background), never inside the timed fast window."""
+        for r in hits:
+            if r.get("shadow"):
+                logger.info("REQUEST %s | user=%s SHADOW rule %s (%s, would %s) — not enforced",
+                            record_id, user_id, r["id"], r["name"],
+                            "block" if r["action"] == "block" else f"add +{r['points']}")
 
     def _record_fast_latency(self, session_id, latency_ms):
         session = self._session(session_id)
@@ -429,7 +441,7 @@ class JudgeLogger(CustomLogger):
         text = self._latest_user_text(data.get("messages"))
         hits = _scan_fast(text, "input")
         points = self._apply_hits(session_id, hits, "input")
-        blockers = [r for r in hits if r["action"] == "block"]
+        blockers = [r for r in hits if r["action"] == "block" and not r.get("shadow")]
         if blockers:
             if user_id:
                 self._blocklist_cache.add(user_id)  # file write happens in the background task
@@ -488,6 +500,7 @@ class JudgeLogger(CustomLogger):
                 "output": "",
             }
             logger.info("REQUEST %s | user=%s BLOCKED PRE-CALL (fast rule, no LLM call): %s", record_id, user_id, names)
+            self._log_shadow_hits(record_id, user_id, decision["hits"])
             self._write_records(record, {
                 "verdict": "bad",
                 "reason": f"Fast rule blocked the request: {names}.",
@@ -495,7 +508,8 @@ class JudgeLogger(CustomLogger):
                 "chat_tokens": 0,
                 "judge_tokens": 0,
                 "fast_latency_ms": latency_ms,
-                "fast_rules": [r["id"] for r in decision["hits"]],
+                "fast_rules": [r["id"] for r in decision["hits"] if not r.get("shadow")],
+                "shadow_rules": [r["id"] for r in decision["hits"] if r.get("shadow")],
                 "points": decision["points"],
                 "session_score": self._session(user_id or "unknown")["score"],
             })
@@ -553,7 +567,8 @@ class JudgeLogger(CustomLogger):
             out_points = self._apply_hits(user_id, out_hits, "output")
             hits = ((pending or {}).get("hits") or []) + out_hits
             points = ((pending or {}).get("points") or 0) + out_points
-            blockers = [r for r in out_hits if r["action"] == "block"]
+            blockers = [r for r in out_hits if r["action"] == "block" and not r.get("shadow")]
+            self._log_shadow_hits(record_id, user_id, hits)
             session = self._session(user_id)
             self._transcripts[user_id].append((self._latest_user_text(messages), output_text))
 
@@ -573,7 +588,7 @@ class JudgeLogger(CustomLogger):
             else:
                 judge_path = "fast"
                 if points > 0:
-                    fired = ", ".join(f"{r['name']} (+{r['points']})" for r in hits if r["action"] == "score")
+                    fired = ", ".join(f"{r['name']} (+{r['points']})" for r in hits if r["action"] == "score" and not r.get("shadow"))
                     verdict = {
                         "verdict": "suspicious",
                         "reason": f"Fast rules fired: {fired} — session score "
@@ -591,7 +606,8 @@ class JudgeLogger(CustomLogger):
                 "chat_tokens": (usage or {}).get("total_tokens", 0),
                 "judge_tokens": (judge_usage or {}).get("total_tokens", 0),
                 "fast_latency_ms": (pending or {}).get("latency_ms"),
-                "fast_rules": [r["id"] for r in hits],
+                "fast_rules": [r["id"] for r in hits if not r.get("shadow")],
+                "shadow_rules": [r["id"] for r in hits if r.get("shadow")],
                 "points": points,
                 "session_score": session["score"],
             })
@@ -717,7 +733,7 @@ class JudgeLogger(CustomLogger):
         ) or "(no transcript available)"
 
     def _format_signals(self, session):
-        fired = [h for h in session["hits"] if h["points"] > 0 or h["action"] == "block"]
+        fired = [h for h in session["hits"] if (h["points"] > 0 or h["action"] == "block") and not h.get("shadow")]
         return "\n".join(
             f"- {h['name']} ({h['scope']}, +{h['points']})" for h in fired
         ) or "- (none recorded)"
