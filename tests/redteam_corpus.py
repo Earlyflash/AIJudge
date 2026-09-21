@@ -98,6 +98,8 @@ def score_case(turns):
     score, blocked, rules = 0, False, []
     for turn in turns:
         for rule in judge_logger._scan_fast(turn, "input"):
+            if rule.get("shadow"):
+                continue  # recorded by the Judge but never enforced
             rules.append(rule["id"])
             if rule["action"] == "block":
                 blocked = True

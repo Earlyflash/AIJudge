@@ -23,6 +23,7 @@ const timelineLegendEl = document.getElementById("timeline-legend");
 const tokenSessionsEl = document.getElementById("token-sessions");
 
 let rulesRendered = false;
+let shadowKey = "";
 let lastBlockedCount = 0;
 
 function fmtNumber(n) {
@@ -296,9 +297,18 @@ function ruleAction(r) {
   return r.action === "block" ? "block" : `+${r.points}`;
 }
 
+function shadowChip(r, data) {
+  if (!r.shadow) return "";
+  const n = (data.shadow_hits || {})[r.id] || 0;
+  return ` <span class="action-chip shadow" title="Shadow rule: recorded but not enforced">shadow &middot; ${n} recent hit${n === 1 ? "" : "s"}</span>`;
+}
+
 function renderRulesOnce(data) {
-  if (rulesRendered) return;
+  // Static apart from the shadow hit counters, so re-render only when those change.
+  const key = JSON.stringify(data.shadow_hits || {});
+  if (rulesRendered && key === shadowKey) return;
   rulesRendered = true;
+  shadowKey = key;
 
   const slow = data.slow_review;
   rulesHintEl.textContent =
@@ -311,7 +321,7 @@ function renderRulesOnce(data) {
       <li>
         <div class="rule-head">
           <span class="rule-name">${esc(r.name)}</span>
-          <span class="rule-mode"><span class="action-chip ${r.action}">${ruleAction(r)}</span> ${esc(r.scope)}</span>
+          <span class="rule-mode"><span class="action-chip ${r.action}">${ruleAction(r)}</span>${shadowChip(r, data)} ${esc(r.scope)}</span>
         </div>
         <div class="rule-desc">${esc(r.description)}</div>
       </li>`

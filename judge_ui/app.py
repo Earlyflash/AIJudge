@@ -128,6 +128,15 @@ async def judge_stats():
     }
 
     threshold = judge_rules.SLOW_REVIEW_THRESHOLD
+    # Per-rule shadow hit counts, from the hits each session retains (recent
+    # only, MAX_HITS_KEPT per session — not lifetime totals).
+    shadow_ids = {r["id"] for r in judge_rules.FAST_RULES if r.get("shadow")}
+    shadow_hits = {rid: 0 for rid in shadow_ids}
+    for s in sessions_file.get("sessions", {}).values():
+        for h in s.get("hits", []):
+            if h.get("shadow") and h.get("rule") in shadow_hits:
+                shadow_hits[h["rule"]] += 1
+
     sessions = []
     for sid, s in sessions_file.get("sessions", {}).items():
         checks = s.get("fast_checks", 0)
@@ -140,7 +149,7 @@ async def judge_stats():
             "fast_checks": checks,
             "fast_latency_avg_ms": (s.get("fast_latency_total_ms", 0) / checks) if checks else 0,
             "fast_latency_max_ms": s.get("fast_latency_max_ms", 0),
-            "recent_hits": [h["name"] for h in s.get("hits", [])[-4:]],
+            "recent_hits": [h["name"] + (" (shadow)" if h.get("shadow") else "") for h in s.get("hits", [])[-4:]],
             "last_review": (s.get("reviews") or [None])[-1],
             "last_seen": s.get("last_seen", 0),
         })
@@ -157,6 +166,7 @@ async def judge_stats():
 
     return {
         "fast_rules": judge_rules.FAST_RULES,
+        "shadow_hits": shadow_hits,
         "slow_review": judge_rules.SLOW_REVIEW,
         "totals": {
             "total_requests": stats.get("total_requests", 0),

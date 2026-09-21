@@ -17,6 +17,10 @@ Two tiers:
   Each rule has one action:
     "block" — the session goes on the blocklist immediately, no AI.
     "score" — add `points` to the session's suspicion score.
+  Any rule may also carry `"shadow": True`: it is evaluated and recorded (in
+  the session's hits, the verdict file's `shadow_rules`, the activity log
+  and the dashboard) but never blocks and adds no points, so a new rule can
+  be trialled against real traffic before it is enforced.
 
   SLOW — the LLM judge. Never run per exchange: when a session's suspicion
   score has climbed SLOW_REVIEW_THRESHOLD points since it was last reviewed,
