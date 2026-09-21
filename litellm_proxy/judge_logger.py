@@ -22,12 +22,15 @@ SLOW — the LLM judge, run only when a session's score has climbed
 """
 
 import asyncio
+import base64
+import codecs
 import json
 import logging
 import os
 import re
 import sys
 import time
+import unicodedata
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -167,19 +170,106 @@ _COMPILED_FAST_RULES = [
 ]
 
 
+# --- Obfuscation normalisation -------------------------------------------
+# The rules are regexes over plain text, so cheap encodings defeat them. Before
+# scanning we derive a few extra *variants* of the text and scan those too; a
+# rule firing on any variant counts. Everything here is in-memory, bounded and
+# pure — it runs inside the timed fast-tier window.
+VARIANT_MAX_CHARS = 8000       # variants are derived from at most this much text
+B64_MAX_CANDIDATES = 5         # base64 blobs decoded per text
+B64_MAX_CHARS = 2048           # longest blob we will try to decode
+
+# Common Cyrillic/Greek lookalikes → Latin (NFKC handles fullwidth etc.).
+_HOMOGLYPHS = str.maketrans({
+    **{ord(k): v for k, v in zip("аеорсухіјѕһԁ", "aeopcyxijshd")},
+    **{ord(k): v for k, v in zip("АВЕКМНОРСТХ", "ABEKMHOPCTX")},
+    **{ord(k): v for k, v in zip("αεικνορτυχ", "aeiknoptux")},
+    **{ord(k): v for k, v in zip("ΑΒΕΗΙΚΜΝΟΡΤΧΥΖ", "ABEHIKMNOPTXYZ")},
+})
+_LEET = str.maketrans("013457@$", "oieastas")
+_LEET_GATE = re.compile(r"[a-z][0-9@$]|[0-9@$][a-z]", re.I)
+_SPACED = re.compile(r"(?<!\S)(?:\S {1,2}){4,}\S(?!\S)")
+_B64_BLOB = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+
+
+def _clean_unicode(text):
+    """NFKC, drop combining marks, zero-width/format/control characters, and
+    fold homoglyphs to Latin. ASCII-only text skips all of it."""
+    if text.isascii():
+        return text
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(
+        c for c in text
+        if unicodedata.category(c) not in ("Mn", "Cf") and (c in "\n\r\t" or unicodedata.category(c) != "Cc")
+    )
+    return unicodedata.normalize("NFKC", text).translate(_HOMOGLYPHS)
+
+
+def _despace(text):
+    """'i g n o r e  a l l' → 'ignore all' (single spaces between letters
+    dropped, a double space kept as the word break)."""
+    def join(m):
+        chunk = m.group(0)
+        if any(len(tok) != 1 for tok in chunk.split()):
+            return chunk
+        return " ".join(w.replace(" ", "") for w in re.split(r" {2,}", chunk))
+    return _SPACED.sub(join, text)
+
+
+def _decode_b64(text):
+    decoded = []
+    for blob in _B64_BLOB.findall(text)[:B64_MAX_CANDIDATES]:
+        if len(blob) > B64_MAX_CHARS:
+            continue
+        raw = blob.replace("-", "+").replace("_", "/")
+        try:
+            out = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if out and sum(c.isprintable() or c in "\n\t" for c in out) / len(out) >= 0.9:
+            decoded.append(out)
+    return decoded
+
+
+def _text_variants(text):
+    """The text itself plus its de-obfuscated forms (deduplicated)."""
+    variants = [text]
+    head = text[:VARIANT_MAX_CHARS]
+    clean = _clean_unicode(head)
+    if clean != head:
+        variants.append(clean)
+    despaced = _despace(clean)
+    if despaced != clean:
+        variants.append(despaced)
+    if _LEET_GATE.search(clean):
+        variants.append(clean.translate(_LEET))
+    variants.append(codecs.encode(clean, "rot13"))
+    for decoded in _decode_b64(head):
+        variants.append(_clean_unicode(decoded))
+    seen, unique = set(), []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            unique.append(v)
+    return unique
+
+
 def _scan_fast(text, scope):
     """Fast tier: every rule for `scope` ("input"/"output") that fires on
-    `text`. Pure and side-effect free — this is the hot path."""
+    `text` or on a de-obfuscated variant of it. Pure and side-effect free —
+    this is the hot path."""
     if not text:
         return []
-    hits = []
-    for rule, pattern, validator in _COMPILED_FAST_RULES:
-        if rule["scope"] != "both" and rule["scope"] != scope:
-            continue
-        for match in pattern.finditer(text):
-            if validator is None or validator(match.group(0)):
-                hits.append(rule)
-                break
+    hits, fired = [], set()
+    for variant in _text_variants(text):
+        for rule, pattern, validator in _COMPILED_FAST_RULES:
+            if rule["id"] in fired or (rule["scope"] != "both" and rule["scope"] != scope):
+                continue
+            for match in pattern.finditer(variant):
+                if validator is None or validator(match.group(0)):
+                    hits.append(rule)
+                    fired.add(rule["id"])
+                    break
     return hits
 
 

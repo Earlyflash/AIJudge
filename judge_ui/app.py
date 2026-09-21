@@ -156,7 +156,11 @@ async def judge_stats():
                 continue
 
     return {
-        "fast_rules": judge_rules.FAST_RULES,
+        # Rules whose real pattern is secret (the canary) carry a redact_pattern to show instead.
+        "fast_rules": [
+            {k: v for k, v in {**r, "pattern": r.get("redact_pattern", r["pattern"])}.items() if k != "redact_pattern"}
+            for r in judge_rules.FAST_RULES
+        ],
         "slow_review": judge_rules.SLOW_REVIEW,
         "totals": {
             "total_requests": stats.get("total_requests", 0),
