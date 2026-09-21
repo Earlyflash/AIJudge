@@ -1,8 +1,10 @@
 # AIJudge
 
 A LiteLLM proxy (fronting Gemini) with a test chat UI, full request/response
-logging to local disk, and an async "Judge" that reviews every exchange for
-suspicious or bad content and can block a session's further access.
+logging to local disk, and a two-tier "Judge": deterministic fast rules
+screen every exchange (and can block it outright), and an LLM judge reviews
+sessions whose suspicion score has built up. It can block a session's
+further access.
 
 ## Architecture
 
@@ -140,6 +142,20 @@ judgment call. It intentionally over-flags: a string that merely has the NINO
 shape (two letters, six digits, one suffix letter) but isn't really one still
 blocks, since for PII the safe failure mode is a false positive.
 
+## Testing the rules
+
+`tests/redteam_corpus.py` scores a corpus of public-technique attack prompts
+(plus benign look-alikes) with the Judge's real fast-tier code and reports
+which are blocked, sent to slow review, or missed:
+
+```powershell
+.\.venv\Scripts\python.exe tests\redteam_corpus.py
+```
+
+It needs no running services or API key. It is a measuring tool, not a
+pass/fail suite — the fast tier deliberately does not catch everything (see
+below).
+
 ## Known limitations
 
 - The fast rules are a small, illustrative pattern list — a novel attack
@@ -147,6 +163,9 @@ blocks, since for PII the safe failure mode is a false positive.
   exchange no rule fired on is marked "safe" with the reason "not reviewed by
   the LLM"; it means unreviewed, not vetted. Tune `FAST_RULES` in
   `judge_rules.py` for stronger coverage.
+- The fast tier runs in the request path, so it does add latency — roughly
+  0.05–0.2 ms per request in local testing, measured on every call and
+  shown on both UIs (the LLM tier adds none).
 - The slow review's transcript is held in the Judge process's memory (the
   last few exchanges per session). A proxy restart forgets it; suspicion
   scores survive, since they're persisted in `data/sessions.json`.

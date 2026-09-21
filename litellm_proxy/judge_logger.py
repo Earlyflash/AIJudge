@@ -7,10 +7,11 @@ different timelines on purpose (rule definitions live in judge_rules.py):
 FAST — deterministic rules, no AI.
   * Input rules run in async_pre_call_hook, i.e. in the request path, so a
     "block" rule stops the *current* request. That is pure regex (plus a
-    Luhn check) over the latest user message and an in-memory blocklist
-    lookup, and the time it takes is measured on every call and stored per
-    session (data/sessions.json) so the latency cost of this decision is
-    visible on both UIs. File writes are kept out of the measured window.
+    Luhn check) over the latest user message and a blocklist check (a stat
+    of the blocklist file plus a set lookup), and the time it takes is
+    measured on every call and stored per session (data/sessions.json) so the
+    latency cost of this decision is visible on both UIs. File writes are
+    kept out of the measured window.
   * Output rules run after the response has been returned.
   * A "score" rule adds points to the session's suspicion score instead.
 
@@ -327,8 +328,9 @@ class JudgeLogger(CustomLogger):
         return ""
 
     def _fast_precheck(self, user_id, data):
-        """Everything the fast tier does in the request path, in memory only
-        (no file I/O) so the timing around it is honest."""
+        """Everything the fast tier does in the request path. No file writes
+        (so the timing around it is honest); the only file access is
+        _refresh_blocklist's mtime stat, which is real request-path cost."""
         session_id = user_id or "unknown"
         if user_id and user_id in self._refresh_blocklist():
             return {"reject": f"Blocked by AIJudge: '{user_id}' was flagged for suspicious/bad activity.",

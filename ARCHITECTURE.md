@@ -2,8 +2,10 @@
 
 This document explains how AIJudge is put together and, more importantly,
 *why* — the decisions that shape it were mostly driven by one hard
-requirement: **the Judge must never add latency to a chat call.** Almost
-every non-obvious design choice below traces back to that constraint.
+requirement: **the AI part of the Judge must never add latency to a chat
+call.** The deterministic fast rules do run in the request path, but they
+are microsecond-scale regex and their cost is measured on every call (§3).
+Almost every non-obvious design choice below traces back to that constraint.
 
 ## 1. System overview
 
@@ -46,16 +48,16 @@ flowchart LR
 
     RULES["judge_rules.py<br/>(shared, no side effects)"]
     G[("Gemini API")]
-    DATA[("data/ on local disk<br/>logs, verdicts, stats.json,<br/>blocked_users.json")]
+    DATA[("data/ on local disk<br/>logs, verdicts, stats.json,<br/>sessions.json, blocked_users.json")]
 
     A -- "POST /api/chat<br/>{session_id, message}" --> BE
     B -- "POST /api/chat<br/>{session_id, message}" --> BE
     BE -- "POST /chat/completions<br/>Bearer LITELLM_MASTER_KEY" --> LP
     LP -- "gemini/gemini-3.6-flash" --> G
 
-    LP -. "async_pre_call_hook<br/>(enforcement, in request path)" .-> J
+    LP -. "async_pre_call_hook<br/>(fast rules, in request path)" .-> J
     LP -. "async_log_success/failure_event<br/>(fire-and-forget, after response sent)" .-> J
-    J -- "LLM-as-judge call<br/>(direct, bypasses proxy)" --> G
+    J -- "slow LLM review<br/>(direct, bypasses proxy)" --> G
     J --> DATA
     BE -- "GET /api/status" --> DATA
     JD -- "reads directly, no dependency on chatui" --> DATA
@@ -64,8 +66,8 @@ flowchart LR
 ```
 
 The dotted lines into the Judge are deliberate: one is a hook that runs
-*before* the call completes (cheap), the other fires *after* it already has
-(the heavy lifting). That split is the core of the whole design — see §3.
+*before* the call completes (the cheap deterministic fast rules), the other
+fires *after* it already has (output rules, verdicts, and the LLM review). That split is the core of the whole design — see §3.
 Note `judge_ui` has no arrow to or from `chatui` at all — that's
 intentional, not an omission (see §5).
 
@@ -73,12 +75,13 @@ intentional, not an omission (see §5).
 
 | Component | File(s) | Responsibility |
 |---|---|---|
-| Frontend (chat UI) | `chatui/frontend/index.html`, `app.js`, `style.css` | Two `ChatPanel` instances, each owning its own client-generated session id; polls `/api/status` for shared judge activity; animates a request pipeline per panel. |
-| Chat UI backend | `chatui/backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; exposes a lightweight `/api/status` for its own sidebar. |
+| Frontend (chat UI) | `chatui/frontend/index.html`, `app.js`, `style.css` | Two `ChatPanel` instances, each owning its own client-generated session id; polls `/api/status` for shared judge activity; animates a request pipeline per panel; shows each session's fast-rule latency and suspicion score. |
+| Chat UI backend | `chatui/backend/app.py` | Stateless proxy between browser and LiteLLM; adds the `Authorization` header the browser never sees; reads `data/sessions.json` to echo each request's fast-rule latency (`fast_check_ms`); exposes a lightweight `/api/status` (verdicts, blocklist, per-session summary) for its own sidebar. |
 | LiteLLM proxy | `litellm_proxy/config.yaml` | Declares the `gemini-flash` model and registers the Judge callback. |
-| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback with both an enforcement hook and a logging/judging hook (see §3); writes `data/stats.json`. |
-| Shared rules | `judge_rules.py` (repo root) | Side-effect-free regex/description source for both the Judge and the dashboard — the single source of truth for what's actually enforced. |
-| Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view: rules, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
+| Judge | `litellm_proxy/judge_logger.py` | A `CustomLogger` callback: the fast tier in the pre-call hook (plus output rules post-call) and the slow LLM review post-call (see §3); writes `data/sessions.json`, `data/stats.json`, logs, verdicts and the blocklist. |
+| Shared rules | `judge_rules.py` (repo root) | Side-effect-free fast rules (regex + validators, actions and weights), the slow-review threshold and description — the single source of truth for what's actually enforced, read by both the Judge and the dashboard. |
+| Judge Dashboard | `judge_ui/app.py`, `judge_ui/frontend/` | Standalone read-only view (plus the blocklist reset): fast and slow rules, fast-rule latency, per-session suspicion scores, verdict breakdown, token usage, unique sessions, requests/sec, blocklist. Independent process and port; no dependency on `chatui/`. |
+| Red-team corpus | `tests/redteam_corpus.py` | Scores attack and benign prompts with the real fast-tier code and reports catches vs misses; a measuring tool, not a pass/fail suite. |
 | Data store | `data/` (gitignored) | The only shared state across all three Python processes — flat JSON files and a log file, no database. |
 
 ## 3. The core design decision: a fast tier and a slow tier
@@ -109,13 +112,16 @@ instructions") is +5 and triggers review alone.
 
 **The fast tier's added latency is measured, not assumed.**
 `async_pre_call_hook` times its own work with `time.perf_counter` — the
-blocklist lookup, the regex scan of the newest user message, and the
-in-memory score update — and records it per session and globally
+blocklist check (a `stat` of the blocklist file, re-read only if it
+changed, then a set lookup), the regex scan of the newest user message, and
+the in-memory score update — and records it per session and globally
 (`data/sessions.json`; the chat backend echoes the per-request figure as
-`fast_check_ms`, and both UIs show it). All file writes are deliberately
-*outside* the measured window and off the request path: session state lives
+`fast_check_ms`, and both UIs show it). All file *writes* are deliberately
+outside the measured window and off the request path: session state lives
 in memory and is flushed to disk by a debounced timer (immediately, on a
-rejection). Typical cost is tens of microseconds.
+rejection). In local testing the measured cost was roughly 0.05–0.2 ms per
+request; expect it to grow with the number and complexity of rules and with
+prompt length, which is why it is reported rather than assumed.
 
 The consequence for the *slow* tier is unchanged and easy to expect wrong:
 **a message that triggers a slow review still gets a completely normal
@@ -182,6 +188,11 @@ nothing ever got blocked despite an obvious attack. Judging outcome instead
 of intent means a persistent attacker who keeps getting refused never
 crosses the blocking threshold.
 
+A request from a session that is *already* on the blocklist is rejected in
+the pre-call hook with the same "Blocked by AIJudge" error; it records a
+latency sample but is not logged or counted as an exchange, and never
+reaches `_handle_event`.
+
 If the LLM judge itself returns empty content (most likely its own safety
 filter balking at the content it's reviewing), that's treated as **"bad"**
 by default — fail closed. A call that *errors* or returns unparseable JSON
@@ -193,7 +204,7 @@ alone, so the next exchange retries the review.
 | Decision | Why | Tradeoff / consequence |
 |---|---|---|
 | The slow (LLM) tier is async, after the response is sent | Hard requirement: an LLM call must never add latency to a chat call | A slow review can never block the exchange that triggered it — only the next one from that session |
-| Fast rules run in the pre-call hook, in the request path | Deterministic regex costs microseconds and lets a `block` rule stop the current request (e.g. a pasted secret) | It is added latency, however small — so it's measured on every call and reported per session on both UIs; file I/O is kept out of it |
+| Fast rules run in the pre-call hook, in the request path | Deterministic regex costs microseconds and lets a `block` rule stop the current request (e.g. a pasted secret) | It is added latency, however small — so it's measured on every call and reported per session on both UIs; file writes are kept out of it (the blocklist `stat` is not) |
 | Judge calls Gemini directly, bypassing the local proxy | Avoid the Judge recursively logging/judging its own LLM-as-judge calls | Judge calls don't benefit from the proxy's own logging/retry config; guarded further by an explicit `aijudge_internal` flag |
 | A per-session suspicion score gates the LLM, instead of "any regex match escalates" | Weak signals add up across turns, and the expensive LLM only runs once there's enough evidence (score climbed >= 5 since last review) | A novel attack matching no rule scores 0 and is never reviewed; exchanges no rule fired on are "safe" only in the sense of *unreviewed* |
 | Slow review judges the session transcript, not one exchange | Catches a slow build-up of individually minor probes | The transcript is in-memory only (last 6 exchanges); a proxy restart forgets it, though scores persist |
@@ -212,8 +223,9 @@ Everything the Judge sees and decides lives under `AIJUDGE_DATA_DIR`
 - `data/logs/<uuid>.json` — every request/response pair
 - `data/verdicts/<uuid>.json` — the Judge's verdict for that pair (read by
   the backend's `/api/status` for the "Recent Verdicts" panel)
-- `data/blocked_users.json` — flat JSON array of blocked session ids (read
-  by the Judge's own enforcement hook, `/api/status`, and `/api/judge-stats`)
+- `data/blocked_users.json` — flat JSON array of blocked session ids (written
+  by the Judge and by the dashboard's reset; read by the Judge's pre-call
+  hook, `/api/status`, and `/api/judge-stats`)
 - `data/judge_activity.log` — human-readable trace of every exchange, every
   prompt sent to the LLM judge, its raw response, and the final verdict
   (also mirrored to the LiteLLM proxy's console)
@@ -253,3 +265,7 @@ ever grew one.
   rubric narrow, but don't eliminate, that variance.
 - Output-side fast rules run after the response is sent, so they can only
   affect the session's later turns.
+- The fast tier is regex, so it is beatable by rewording, obfuscation
+  (leetspeak, homoglyphs, encodings), other languages and fictional framing.
+  Run `tests/redteam_corpus.py` to see, for the current rules, which
+  public-technique prompts are caught and which slip through.

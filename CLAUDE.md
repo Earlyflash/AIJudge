@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 AIJudge: a LiteLLM proxy fronting Gemini, a test chat UI, full request/response
-logging to local disk, and an async "Judge" callback that reviews every
-exchange for suspicious/bad content and can block a session's future access.
+logging to local disk, and a two-tier "Judge" callback: deterministic fast
+rules screen every exchange (and can block it outright), and an LLM judge
+reviews sessions whose suspicion score has built up. It can block a session's
+future access.
 There's also a standalone Judge Dashboard, deliberately a separate service
 from the chat UI (see "Judge Dashboard" below).
 
@@ -20,6 +22,8 @@ Top-level layout:
 - `judge_ui/` (`app.py` + `frontend/`) — the standalone Judge Dashboard
 - `judge_rules.py` (repo root) — rule definitions shared by the Judge and
   the dashboard, so they can never drift apart
+- `tests/redteam_corpus.py` — attack/benign prompt corpus scored with the
+  fast tier's real code (see Commands)
 - `data/` (gitignored) — the only thing all three processes share
 
 ## Commands
@@ -36,7 +40,12 @@ process environment before launching — there is no other env-loading path
 for the LiteLLM proxy, so if you run `litellm` manually, load `.env` first.
 
 `.env` (copied from `.env.example`, gitignored) must have `GEMINI_API_KEY`
-set for either process to actually reach Gemini. No test suite exists yet.
+set for either process to actually reach Gemini. There is no automated test
+suite. `tests/redteam_corpus.py` is a runner, not assertions: from the repo
+root, `.venv\Scripts\python.exe tests\redteam_corpus.py` scores a corpus of
+public-technique attack prompts (and benign look-alikes) with the real
+`judge_logger._scan_fast`, and prints which are blocked / sent to slow review
+/ missed by the fast tier. Re-run it after changing `FAST_RULES`.
 
 ## Architecture
 
@@ -63,8 +72,13 @@ one-per-domain and can't do that. The backend has no server-side session
 state at all; it just forwards whatever `session_id` it's given to LiteLLM
 as the OpenAI `user` field, which is the identity the Judge blocks.
 `/api/status` returns the global blocklist/verdict lists (not scoped to a
-session) and the frontend checks locally whether each panel's own id
-appears in `blocked_users`.
+session), a per-session summary from `data/sessions.json` (suspicion score
+and fast-rule latency, keyed by session id) and the slow-review threshold;
+the frontend checks locally whether each panel's own id appears in
+`blocked_users` and looks up its own entry in `sessions`. `/api/chat` also
+reads `sessions.json` right after LiteLLM responds and echoes the request's
+fast-rule latency as `fast_check_ms` (the pre-call hook wrote it before the
+response came back). The backend still holds no session state of its own.
 
 ## Judge Dashboard (`judge_ui/`)
 
@@ -88,7 +102,8 @@ unique session count), a derived `requests_per_second` (see below), the
 current blocklist, and up to 50 recent verdicts.
 
 `POST /api/blocklist/reset` overwrites `blocked_users.json` with `[]` and
-returns what was cleared. There's no coordination needed with the Judge
+returns what was cleared. It does not touch `sessions.json`: suspicion scores
+and review watermarks are kept, so an unblocked session carries its score. There's no coordination needed with the Judge
 process beyond that write: `_refresh_blocklist` in `judge_logger.py`
 compares the file's mtime on every enforcement check and re-reads it if
 it's changed, so the reset takes effect on that process's very next call
@@ -124,10 +139,15 @@ split: **an LLM call must never add latency to a chat call.**
   suspicion score instead. Output rules run in `_handle_event`, after the
   response has gone back. The hook times its own work
   (`time.perf_counter`) and stores it per session and globally — keep it
-  that way: `_fast_precheck` must stay **in-memory only** (no file I/O), and
-  file writes (`sessions.json` via the debounced `_schedule_persist`, the
-  blocklist file, exchange records) must stay outside the timed window,
-  otherwise the reported "latency added by the fast rules" is a lie.
+  that way. The timed window (`_fast_precheck`) is in-memory apart from one
+  thing: `_refresh_blocklist` `stat`s the blocklist file on every call (and
+  re-reads it when the mtime changed, e.g. after a dashboard reset), which
+  is deliberately inside the window because it is real request-path cost.
+  All file *writes* (`sessions.json` via the debounced `_schedule_persist`,
+  the blocklist file, exchange records) must stay outside it, otherwise the
+  reported "latency added by the fast rules" is a lie. Requests from an
+  already-blocked session are rejected in the same hook, record a latency
+  sample, but are not logged as exchanges.
 - **Slow** — the LLM judge, `_slow_review` → `_llm_judge`. Only runs from
   `_handle_event` (async, after the response) when
   `score - reviewed_score >= judge_rules.SLOW_REVIEW_THRESHOLD`. It reviews
@@ -183,8 +203,8 @@ blocks. For PII, false positives are the safe failure mode.
   `chatui/backend/app.py`'s `/api/status` and by `judge_ui/app.py`'s
   `/api/judge-stats`
 - `data/blocked_users.json` — flat JSON array of blocked session ids, written
-  by the Judge, read by the Judge's own enforcement hook, `/api/status`, and
-  `/api/judge-stats`
+  by the Judge (and cleared by the dashboard's reset), read by the Judge's
+  pre-call hook, `/api/status`, and `/api/judge-stats`
 - `data/judge_activity.log` — every exchange, judge prompt, judge raw
   response, and final verdict, via the `aijudge` logger in
   `judge_logger.py` (also mirrored to the LiteLLM proxy's console)
@@ -228,8 +248,8 @@ directly in `judge_ui/` with no `backend/` subfolder). Concretely:
 restructure any of these three, recompute this per file — don't copy the
 `.parent` chain from one to another without checking its actual depth.
 
-All three processes read `blocked_users.json` and `data/verdicts/`
-independently — they're different Python processes, so `data/` is the only
+All three processes read `blocked_users.json`, `sessions.json` and
+`data/verdicts/` independently — they're different Python processes, so `data/` is the only
 shared state between them. There is no locking; writes are whole-file
 rewrites of small JSON structures, which is fine at this scale but
 wouldn't survive concurrent writers at higher volume.
